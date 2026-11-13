@@ -3,7 +3,7 @@
 **Status: draft v0.** Everything here may change until v1.0.
 
 Contents: 1. Physical layer · 2. Bursts and error correction · 3. Link layer ·
-4. Host interface (VARA-compatible TCP).
+4. Host interface (VARA-compatible TCP, KISS).
 
 ## 1. Physical layer
 
@@ -143,7 +143,7 @@ the 10 field bytes.
 
 | Bits | Field |
 |---|---|
-| 3 | kind: 0 ConnectReq, 1 ConnectAck, 2 Data, 3 Disc, 4 DiscAck |
+| 3 | kind: 0 ConnectReq, 1 ConnectAck, 2 Data, 3 Disc, 4 DiscAck, 5 Unproto (§3.4); 6 and 7 unassigned |
 | 8 | session id (random, chosen by the caller) |
 | 3 | payload speed level |
 | 5 | ncw: payload codewords (0–24) |
@@ -153,6 +153,16 @@ the 10 field bytes.
 | 24 | ack_offset: next byte offset expected from the peer, mod 2²⁴ |
 | 24 | bitmap: bit *i* (LSB = codeword 0) set if codeword *i* of burst `ack_burst` decoded |
 | 4 | flags: bit 0 = POLL (the peer must answer) |
+
+A receiver drops a header whose kind it does not know exactly as it drops one that failed
+its CRC: no burst is reported and the payload is not decoded. Every version back to 0.1.0
+does this, which is why kind 5 could be added without a minor version bump. A burst like
+that counts as channel activity only through the level detector, which takes a steady
+sound as background within about 2 s. So a station older than kind 5 reads an Unproto
+burst as busy for about its first 1.7 s only (measured with v0.3.1 and with master
+before kind 5). A narrow level-0 burst of one codeword (about 1.9 s on the air) is
+covered almost entirely. In a longer one, an older station that has something to send
+may start transmitting in the second half.
 
 ### 2.4 LDPC codes
 Systematic IRA codes: `H = [Hu | Hp]`, where `Hp` is a staircase (check *i* holds parity
@@ -253,6 +263,43 @@ and checked by the `fer_gate` test. That file is the reference; roughly, the poi
   a station that already closed still answers a repeated `Disc`.
 - **ABORT:** the station sends one `Disc` without waiting and closes at once.
 
+### 3.4 Unproto (unconnected broadcast)
+An `Unproto` burst (kind 5) carries frames from the host's KISS port (§4.5) to every
+station that hears it. There is no session, no acknowledgement and no retry, like an AX.25
+UI frame.
+
+- **Header:** kind 5, `level` and `ncw` as for any burst. Every other field is 0, and
+  receivers ignore it. Session id 0 never matches a session (callers pick 1–255).
+- **Payload:** the data bytes of the `ncw` codewords, joined in order:
+  `0x01 (format) | { length (u16, big-endian, ≥ 1) | frame }* | zero padding`. A frame is a
+  whole KISS frame after unescaping, type byte first, carried unchanged. `ncw` is the
+  smallest number of codewords that holds it all. A receiver reads frames until the
+  first codeword that failed its CRC. After that point no length can be trusted, so the
+  frames that touch that codeword or come after it are lost. A payload with another
+  format byte is dropped.
+- **Level:** 0, or 1 if the first frame waiting does not fit at level 0. There is no
+  feedback, so no rate adaptation. One burst holds at most `max_ncw(level) × 146 − 1`
+  bytes of frames plus lengths:
+
+  | Mode | Level 0 | Level 1 | Longest frame |
+  |---|---|---|---|
+  | narrow | 291 | 729 | 727 |
+  | wide | 875 | 1897 | 1895 |
+
+  A longer frame is dropped.
+- **Batching:** frames that reach the modem within 0.3 s of each other share a burst, as
+  far as they fit, in the order they arrived; frames are never reordered. The first frame
+  waits at most 2 s for others. Frames that do not fit go in the next burst.
+- **Channel access:** an Unproto burst is sent only while the station has no session and is
+  not connecting, so frames written during a session wait until it ends. The channel must
+  also have been clear for 0.5 s plus a random 0–0.5 s, measured again before each burst.
+  That is longer than a session's 0.2 s turnaround, so a broadcast does not step into
+  the gap between two other stations' turns. Up to 64 frames or 32 KB wait; beyond that
+  the oldest are dropped.
+- **Reception:** every station delivers the frames of every Unproto burst it decodes to its
+  KISS clients, whatever its state, including during a session of its own. They do not
+  affect the session.
+
 No encryption is used, and there is no compression yet.
 
 ## 4. Host interface
@@ -318,3 +365,26 @@ travel on different sockets.
 - If the command-port client disconnects, any session is aborted.
 - Not implemented: `CQFRAME`, `SN` reports, `REGISTERED`/`LINK REGISTERED`, encryption,
   compression.
+
+### 4.5 KISS port
+A separate TCP port (`modem --kiss-port`, default 8100, `off` to disable; the same default
+as VARA FM's KISS port) carries unconnected broadcasts (§3.4). Frames are
+`FEND (0xC0) | type byte | data | FEND`, with FESC (0xDB) escaping: FEND inside a frame is
+sent as `DB DC`, and FESC as `DB DD`.
+
+- **Host → modem:** data frames are queued for an Unproto burst. A data frame is command 0
+  on any port (`type & 0x0F == 0`), or command 1 with more than one data byte. VarAC and
+  VARA FM use type 1 for frames with 7-character AX.25 addresses: Ortoo's CQ is
+  `C0 01 "CQ" … 03 F0 C0`. A real TXDELAY command carries exactly one byte. The other
+  commands are accepted and ignored: TXDELAY, P, SlotTime, TXtail, FullDuplex,
+  SetHardware and Return (`0xFF`). VardeFM uses its own leader and channel access.
+  Empty frames and bytes before the first FEND are ignored.
+- **Modem → host:** each received frame, exactly as the sender's host wrote it, type byte
+  included: `C0 <type> <escaped data> C0`. A station's own frames are not echoed to it.
+- VardeFM does not parse the frames. AX.25 UI frames (APRS, VarAC, Ortoo) pass through
+  unchanged, and so would any other bytes.
+- Any number of clients may connect at once. Each gets every received frame, and any of
+  them may send.
+
+`sim-pair` gives each station a KISS port: `--a-kiss-port` (default 8100) and
+`--b-kiss-port` (default 8110), each a port number or `off`.

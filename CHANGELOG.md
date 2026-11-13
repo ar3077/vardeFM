@@ -6,7 +6,24 @@ run the same minor version.
 
 ## [Unreleased]
 
+This build is versioned `0.3.1-ortoo.1`: upstream master plus unconnected broadcasts for
+Ortoo. It is on-air compatible with 0.3.0 and 0.3.1. Sessions are unchanged, and older
+stations ignore the new burst kind.
+
 ### Added
+- **Unconnected broadcasts (Unproto) and a KISS port.** A new burst kind, 5 (`Unproto`),
+  carries frames from a KISS-over-TCP port (default 8100, like VARA FM's;
+  `modem --kiss-port <n|off>`) to every station that hears it. Each station delivers the
+  frames to its own KISS clients byte for byte, KISS type byte included, so AX.25 UI
+  frames work as on VARA FM: APRS, VarAC and Ortoo CQs (type 1, 7-character addresses)
+  and broadcasts. Frames written within 0.3 s of each other share one burst, in order.
+  Bursts use level 0, or level 1 for a frame too long for it, and go out only while there
+  is no session, after the channel has been clear for 0.5–1 s. Unproto bursts are
+  received in any state, including during a session. Stations older than this ignore
+  kind 5 the way they ignore a corrupted header and report nothing. Their busy detection
+  covers only about the first 1.7 s of such a burst, so in a longer burst an older
+  station may start to transmit (PROTOCOL.md §2.3). `sim-pair` has `--a-kiss-port`/`--b-kiss-port` (defaults 8100/8110).
+  Details in docs/PROTOCOL.md §2.3, §3.4 and §4.5.
 - **Performance gates.** `level_gate` and `fer_gate` are ignored tests, run by hand in
   release mode, that fail when decoding performance moves. Per mode and level, the CNR
   at which 10 % of codewords fail, and per mode and drive level the CNR at which 10 % of
@@ -30,6 +47,8 @@ run the same minor version.
   transmission no longer carries over it. (#10)
 
 ### Fixed
+- `cargo clippy -- -D warnings` passes again with Rust 1.100 (`needless_range_loop` in the
+  link tests).
 - A NaN, an Inf or a sample far beyond full scale from the sound card no longer loses a
   burst it falls in or shortly before, and cannot leave busy detection deaf; the last
   good sample takes its place. (#10)

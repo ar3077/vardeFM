@@ -78,7 +78,7 @@ Two VardeFM modems in one process, joined by the FM channel simulator. Each has 
 VARA TCP ports, so two host applications can connect to each other with no radios.
 
 ```sh
-# Station A on 8300/8301, station B on 8310/8311, 18 dB CNR, 40 ppm clock error
+# Station A on 8300/8301 (KISS 8100), station B on 8310/8311 (KISS 8110), 18 dB CNR, 40 ppm clock error
 vardefm sim-pair --cnr 18 --ppm -40 --record wavs
 ```
 
@@ -89,6 +89,7 @@ vardefm sim-pair --cnr 18 --ppm -40 --record wavs
 | `--ppm <n>` | sound-card clock error |
 | `--keyup <s>`, `--txdelay <s>` | radio key-up time and the modem's leader (must be longer) |
 | `--a-port`, `--b-port` | command ports (data = +1); defaults 8300 and 8310 |
+| `--a-kiss-port`, `--b-kiss-port` | KISS ports for unconnected broadcasts; defaults 8100 and 8110, `off` to disable |
 | `--speed <x>` | run x times faster than real time (0 = as fast as possible) |
 | `--record <dir>` | save each transmission as `NNNN_<A\|B>_tx.wav` and `_rx.wav` |
 | `--seed <n>` | noise seed |
@@ -130,6 +131,10 @@ Useful options: `--txdelay` (leader length; it must exceed the radio's key-up ti
 - `crates/vardefm-tnc/tests/simpair.rs`: end to end. Two host clients talk over the VARA
   TCP interface through `sim-pair` and transfer 10 kB each way at several signal levels.
   Set `VARDEFM_SIM_VERBOSE=1` to print every transmission.
+- `crates/vardefm-tnc/tests/unproto.rs`: unconnected broadcasts. Ortoo's CQ and broadcast
+  KISS frames go into one station's KISS port and must come out of the other's byte for
+  byte, in order. A broadcast must wait for a session to end, and a third station's
+  broadcast must reach both ends of a session in progress.
 
 To keep the audio from the `audio` tests as WAV files (the folder is created in the repo root):
 

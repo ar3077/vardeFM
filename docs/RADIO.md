@@ -105,6 +105,8 @@ your user needs to be in group `gpio` (the default user already is):
    .\vardefm modem --audio-in "USB Audio" --audio-out "USB Audio" --ptt cm108
    ```
    Then point Pat / HamBBS / Winlink Express at VARA FM on `127.0.0.1:8300`.
+   Unconnected broadcasts (APRS-style UI frames, VarAC/Ortoo CQs) use the KISS port,
+   `127.0.0.1:8100` (`--kiss-port <n>` to move it, `--kiss-port off` to disable it).
    Use `--mode wide` only with the radio's flat 9600-baud data port, on both
    stations. Stop with Ctrl-C; PTT is released on exit.
 
