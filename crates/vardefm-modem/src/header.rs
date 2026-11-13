@@ -14,6 +14,10 @@ pub enum Kind {
     Disc = 3,
     /// Session closed.
     DiscAck = 4,
+    /// Unconnected broadcast: host frames for every station that hears it (no
+    /// session, no acknowledgement). Stations older than this kind drop it like
+    /// a header that failed its CRC.
+    Unproto = 5,
 }
 
 impl Kind {
@@ -24,6 +28,8 @@ impl Kind {
             2 => Self::Data,
             3 => Self::Disc,
             4 => Self::DiscAck,
+            5 => Self::Unproto,
+            // 6 and 7 are unassigned: such a burst is dropped, as by older versions.
             _ => return None,
         })
     }
@@ -33,7 +39,7 @@ impl Kind {
 ///
 /// | bits | field |
 /// |---|---|
-/// | 3 | kind |
+/// | 3 | kind (0-5; 6 and 7 unassigned, dropped) |
 /// | 8 | session id |
 /// | 3 | payload speed level |
 /// | 5 | ncw: payload codewords (0-24) |
@@ -142,5 +148,24 @@ mod tests {
         let mut bad = p;
         bad[3] ^= 1;
         assert_eq!(Header::unpack(&bad), None);
+    }
+
+    #[test]
+    fn unproto_roundtrip() {
+        let h = Header { kind: Kind::Unproto, level: 1, ncw: 5, burst_id: 3, ..Header::default() };
+        assert_eq!(Header::unpack(&h.pack()), Some(h));
+    }
+
+    /// The contract that lets new kinds go on the air: a header whose CRC is good but
+    /// whose kind is unknown decodes to nothing, exactly like a corrupted header.
+    #[test]
+    fn unknown_kind_is_dropped() {
+        for kind in [6u8, 7] {
+            let mut p = Header { kind: Kind::Data, level: 2, ncw: 3, ..Header::default() }.pack();
+            p[0] = (p[0] & 0x1f) | (kind << 5);
+            let c = crc16(&p[..10]);
+            p[10..].copy_from_slice(&c.to_be_bytes());
+            assert_eq!(Header::unpack(&p), None, "kind {kind}");
+        }
     }
 }
