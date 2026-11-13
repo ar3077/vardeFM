@@ -135,6 +135,9 @@ enum Cmd {
         /// Command port (data port = +1)
         #[arg(long, default_value_t = 8300)]
         port: u16,
+        /// KISS port for unconnected broadcasts (Unproto), or "off"
+        #[arg(long, default_value = "8100")]
+        kiss_port: String,
         /// Save every transmitted burst as a WAV file in this folder
         #[arg(long)]
         record: Option<String>,
@@ -232,10 +235,24 @@ enum Cmd {
         /// Command port of station B (data port = +1)
         #[arg(long, default_value_t = 8310)]
         b_port: u16,
+        /// KISS port of station A (unconnected broadcasts), or "off"
+        #[arg(long, default_value = "8100")]
+        a_kiss_port: String,
+        /// KISS port of station B (unconnected broadcasts), or "off"
+        #[arg(long, default_value = "8110")]
+        b_kiss_port: String,
         /// Save every transmission as NNNN_<A|B>_tx.wav / _rx.wav in this folder
         #[arg(long)]
         record: Option<String>,
     },
+}
+
+/// A KISS port option: a port number (0 = any free port) or "off".
+fn kiss_port(s: &str) -> Option<u16> {
+    if s.eq_ignore_ascii_case("off") {
+        return None;
+    }
+    Some(s.parse().unwrap_or_else(|_| die(&format!("KISS port must be a port number or off, not {s:?}"))))
 }
 
 fn die(msg: &str) -> ! {
@@ -362,6 +379,7 @@ fn main() {
             tx_gain,
             host,
             port,
+            kiss_port: kiss,
             record,
             max_level,
             quiet,
@@ -372,6 +390,7 @@ fn main() {
                 mode,
                 host,
                 port,
+                kiss_port: kiss_port(&kiss),
                 audio_in,
                 audio_out,
                 in_channel,
@@ -408,7 +427,21 @@ fn main() {
             radio_cmds::monitor(audio_in.as_deref(), in_channel, &mode).unwrap_or_else(|m| die(&m))
         }
         Cmd::Decode { mode, input } => radio_cmds::decode(&input, &mode).unwrap_or_else(|m| die(&m)),
-        Cmd::SimPair { mode, cnr, ppm, keyup, txdelay, seed, speed, host, a_port, b_port, record } => {
+        Cmd::SimPair {
+            mode,
+            cnr,
+            ppm,
+            keyup,
+            txdelay,
+            seed,
+            speed,
+            host,
+            a_port,
+            b_port,
+            a_kiss_port,
+            b_kiss_port,
+            record,
+        } => {
             if keyup >= txdelay {
                 die("--txdelay must be longer than --keyup");
             }
@@ -423,6 +456,8 @@ fn main() {
                 host,
                 a_port,
                 b_port,
+                a_kiss_port: kiss_port(&a_kiss_port),
+                b_kiss_port: kiss_port(&b_kiss_port),
                 record: record.map(Into::into),
                 verbose: true,
             };
@@ -435,8 +470,9 @@ fn main() {
                 keyup,
                 speed
             );
-            for (name, (c, d)) in ["A", "B"].iter().zip(sp.addrs) {
-                println!("  station {name}: command {c}, data {d}");
+            for (i, (name, (c, d))) in ["A", "B"].iter().zip(sp.addrs).enumerate() {
+                let kiss = sp.kiss_addrs[i].map_or("off".to_string(), |k| k.to_string());
+                println!("  station {name}: command {c}, data {d}, KISS {kiss}");
             }
             println!("Ctrl-C to stop.");
             sp.wait();

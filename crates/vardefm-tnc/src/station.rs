@@ -15,6 +15,8 @@ pub enum HostOut {
     Line(String),
     /// Bytes for the data port.
     Data(Vec<u8>),
+    /// A frame for the KISS port (type byte first, unescaped).
+    Kiss(Vec<u8>),
 }
 
 /// A burst that has just been keyed up.
@@ -103,6 +105,12 @@ impl Station {
         self.link.send_data(data);
     }
 
+    /// A data frame from the KISS port (type byte first): queued for an Unproto
+    /// burst. Frames too long for one burst are dropped (counted in the link stats).
+    pub fn kiss_in(&mut self, now: f64, frame: &[u8]) {
+        self.link.send_unproto(now, frame);
+    }
+
     /// The host closed the command port: drop any session.
     pub fn host_closed(&mut self, now: f64) {
         self.link.abort(now);
@@ -173,6 +181,7 @@ impl Station {
                 LinkEvent::Disconnected => HostOut::Line("DISCONNECTED".into()),
                 LinkEvent::Buffer(n) => HostOut::Line(format!("BUFFER {n}")),
                 LinkEvent::Data(d) => HostOut::Data(d),
+                LinkEvent::Unproto(f) => HostOut::Kiss(f),
             };
             self.out.push(o);
         }

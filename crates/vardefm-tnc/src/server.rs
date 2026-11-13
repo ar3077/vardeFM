@@ -25,6 +25,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::kiss::KissPort;
+
 #[derive(Debug)]
 pub enum HostIn {
     /// One command line (without the terminator).
@@ -33,6 +35,8 @@ pub enum HostIn {
     Data(Vec<u8>),
     /// The command-port client went away.
     CmdClosed,
+    /// A KISS data frame from the KISS port, type byte first (unescaped).
+    Kiss(Vec<u8>),
 }
 
 type Slot = Arc<Mutex<Option<TcpStream>>>;
@@ -79,15 +83,26 @@ pub struct HostPort {
     cmd_out: Slot,
     data_out: Slot,
     stop: Arc<AtomicBool>,
+    kiss: Option<KissPort>,
 }
 
 impl HostPort {
     /// Listen on `host:cmd_port` and `host:data_port` (port 0 picks a free port).
     pub fn bind(host: &str, cmd_port: u16, data_port: u16) -> io::Result<Self> {
+        Self::bind_with_kiss(host, cmd_port, data_port, None)
+    }
+
+    /// As [`HostPort::bind`], plus a KISS port on `host:kiss_port` if given
+    /// (0 picks a free port). Its frames arrive in the same inbox.
+    pub fn bind_with_kiss(host: &str, cmd_port: u16, data_port: u16, kiss_port: Option<u16>) -> io::Result<Self> {
         let cmd = TcpListener::bind((host, cmd_port))?;
         let data = TcpListener::bind((host, data_port))?;
         let (tx, inbox) = channel();
         let stop = Arc::new(AtomicBool::new(false));
+        let kiss = match kiss_port {
+            Some(p) => Some(KissPort::bind(host, p, tx.clone(), stop.clone())?),
+            None => None,
+        };
         let sync = Arc::new(DataSync {
             epoch: Instant::now(),
             empty_at: AtomicU64::new(0),
@@ -100,6 +115,7 @@ impl HostPort {
             cmd_out: Arc::default(),
             data_out: Arc::default(),
             stop: stop.clone(),
+            kiss,
         };
         spawn_acceptor(cmd, port.cmd_out.clone(), tx.clone(), stop.clone(), sync.clone(), true);
         spawn_acceptor(data, port.data_out.clone(), tx, stop, sync, false);
@@ -115,8 +131,23 @@ impl HostPort {
         write_to(&self.data_out, data);
     }
 
+    /// Address of the KISS port, if there is one.
+    pub fn kiss_addr(&self) -> Option<SocketAddr> {
+        self.kiss.as_ref().map(|k| k.addr)
+    }
+
+    /// Send one KISS frame (type byte first) to every KISS client.
+    pub fn send_kiss(&self, frame: &[u8]) {
+        if let Some(k) = &self.kiss {
+            k.send(frame);
+        }
+    }
+
     pub fn shutdown(&self) {
         self.stop.store(true, Ordering::Relaxed);
+        if let Some(k) = &self.kiss {
+            k.shutdown();
+        }
         for slot in [&self.cmd_out, &self.data_out] {
             if let Some(s) = slot.lock().unwrap().take() {
                 let _ = s.shutdown(std::net::Shutdown::Both);
@@ -270,7 +301,7 @@ mod tests {
                         assert_eq!(got, block.len(), "round {round}: DISCONNECT overtook data");
                         break;
                     }
-                    HostIn::CmdClosed => panic!("command port closed"),
+                    HostIn::CmdClosed | HostIn::Kiss(_) => panic!("unexpected input"),
                 }
             }
         }

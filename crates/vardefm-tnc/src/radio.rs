@@ -28,6 +28,8 @@ pub struct RadioConfig {
     pub host: String,
     /// Command port (data = +1).
     pub port: u16,
+    /// KISS port for unconnected broadcasts (None = off).
+    pub kiss_port: Option<u16>,
     pub audio_in: Option<String>,
     pub audio_out: Option<String>,
     pub in_channel: Channel,
@@ -59,6 +61,7 @@ impl Default for RadioConfig {
             mode: "narrow".into(),
             host: "127.0.0.1".into(),
             port: 8300,
+            kiss_port: Some(8100),
             audio_in: None,
             audio_out: None,
             in_channel: Channel::Left,
@@ -189,6 +192,7 @@ impl<S: AudioSink> RadioEngine<S> {
                 HostIn::Line(l) => self.station.host_line(now, &l),
                 HostIn::Data(d) => self.station.host_data(&d),
                 HostIn::CmdClosed => self.station.host_closed(now),
+                HostIn::Kiss(f) => self.station.kiss_in(now, &f),
             }
         }
         self.station.tick(now);
@@ -275,7 +279,7 @@ pub fn run(cfg: RadioConfig, stop: Arc<AtomicBool>) -> io::Result<()> {
     let link = LinkConfig { max_level: cfg.max_level, start_level: cfg.max_level.min(1), ..LinkConfig::default() };
     let input = open_input(cfg.audio_in.as_deref(), cfg.in_channel)?;
     let output = open_output(cfg.audio_out.as_deref(), cfg.out_channel)?;
-    let port = HostPort::bind(&cfg.host, cfg.port, cfg.port + 1)?;
+    let port = HostPort::bind_with_kiss(&cfg.host, cfg.port, cfg.port + 1, cfg.kiss_port)?;
     if let Some(d) = &cfg.record {
         std::fs::create_dir_all(d)?;
     }
@@ -287,6 +291,10 @@ pub fn run(cfg: RadioConfig, stop: Arc<AtomicBool>) -> io::Result<()> {
         println!("  max level: {} ({})", cfg.max_level, LEVELS[cfg.max_level as usize].name);
     }
     println!("  host     : command {}, data {}", port.cmd_addr, port.data_addr);
+    match port.kiss_addr() {
+        Some(a) => println!("  KISS     : {a} (unconnected broadcasts)"),
+        None => println!("  KISS     : off"),
+    }
 
     if cfg.show_levels {
         println!("  levels   : every {LEVEL_WINDOW_S} s while idle; set the radio volume so bursts peak near -6 dBFS");
@@ -303,6 +311,7 @@ pub fn run(cfg: RadioConfig, stop: Arc<AtomicBool>) -> io::Result<()> {
             match o {
                 HostOut::Line(l) => port.send_line(&l),
                 HostOut::Data(d) => port.send_data(&d),
+                HostOut::Kiss(f) => port.send_kiss(&f),
             }
         }
         for l in engine.log.drain(..) {

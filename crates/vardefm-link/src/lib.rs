@@ -25,6 +25,10 @@
 //! - **Disconnect:** after the host's DISCONNECT, once all sent data is
 //!   acknowledged, the station sends `Disc` and the peer answers `DiscAck`. Both
 //!   then report DISCONNECTED.
+//! - **Unproto:** unconnected broadcast bursts carry host frames (KISS) to every
+//!   station that hears them, with no session and no acknowledgement. They are
+//!   sent only while no session is active or being set up, after the channel has
+//!   been clear for a while; see [`Link::send_unproto`].
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
@@ -58,6 +62,69 @@ pub fn level_by_snr(modem: &Modem, snr_db: f32, rx_level: u8) -> u8 {
 
 const SEGMENT_HEADER: usize = 4;
 const OFFSET_MOD: u64 = 1 << 24;
+
+/// First byte of an Unproto payload: the format of what follows.
+pub const UNPROTO_FORMAT: u8 = 1;
+/// Frames that reach the host within this long of each other go out in one burst.
+pub const UNPROTO_BATCH_S: f64 = 0.3;
+/// ... but the first frame of a burst is never held back longer than this.
+const UNPROTO_BATCH_MAX_S: f64 = 2.0;
+/// The channel must have been clear this long, plus a random 0 to
+/// [`UNPROTO_CLEAR_RANDOM_S`], before an Unproto burst starts. Longer than a
+/// session's turnaround, so that a broadcast does not step into the gap between
+/// two other stations' turns.
+pub const UNPROTO_CLEAR_S: f64 = 0.5;
+pub const UNPROTO_CLEAR_RANDOM_S: f64 = 0.5;
+/// Queue limits; beyond them the oldest frames are dropped.
+const UNPROTO_QUEUE_FRAMES: usize = 64;
+const UNPROTO_QUEUE_BYTES: usize = 32 * 1024;
+/// Speed levels an Unproto burst may use: the most robust one, and the next for a
+/// frame too long for it. There is no feedback, so there is no rate adaptation.
+pub const UNPROTO_LEVELS: [u8; 2] = [0, 1];
+
+/// Bytes available for frames (each with its 2-byte length) in one Unproto burst.
+pub fn unproto_capacity(modem: &Modem, level: u8) -> usize {
+    modem.max_ncw(level) * Modem::payload_bytes(level) - 1
+}
+
+/// Longest frame an Unproto burst can carry.
+pub fn unproto_max_frame(modem: &Modem) -> usize {
+    unproto_capacity(modem, UNPROTO_LEVELS[UNPROTO_LEVELS.len() - 1]) - 2
+}
+
+/// Unproto payload: `UNPROTO_FORMAT | { length (u16, big-endian, > 0) | frame }* | zero padding`,
+/// spread over as few codewords of `level` as it needs. The caller checks that it fits.
+pub fn pack_unproto(level: u8, frames: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    let cw = Modem::payload_bytes(level);
+    let mut data = vec![UNPROTO_FORMAT];
+    for f in frames {
+        debug_assert!(!f.is_empty() && f.len() <= u16::MAX as usize);
+        data.extend_from_slice(&(f.len() as u16).to_be_bytes());
+        data.extend_from_slice(f);
+    }
+    data.resize(data.len().div_ceil(cw) * cw, 0);
+    data.chunks(cw).map(<[u8]>::to_vec).collect()
+}
+
+/// The frames of a received Unproto payload, in order. Reading stops at the first
+/// codeword that failed: nothing after it can be trusted, frame lengths included.
+pub fn parse_unproto(payload: &[Option<Vec<u8>>]) -> Vec<Vec<u8>> {
+    let data: Vec<u8> = payload.iter().map_while(|cw| cw.as_deref()).flatten().copied().collect();
+    let mut out = Vec::new();
+    if data.first() != Some(&UNPROTO_FORMAT) {
+        return out;
+    }
+    let mut pos = 1;
+    while pos + 2 <= data.len() {
+        let len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+        if len == 0 || pos + 2 + len > data.len() {
+            break;
+        }
+        out.push(data[pos + 2..pos + 2 + len].to_vec());
+        pos += 2 + len;
+    }
+    out
+}
 
 #[derive(Clone, Debug)]
 pub struct LinkConfig {
@@ -108,6 +175,8 @@ pub enum LinkEvent {
     /// Bytes queued for transmission and not yet acknowledged.
     Buffer(usize),
     Data(Vec<u8>),
+    /// One frame from a received Unproto burst (from any station, in any state).
+    Unproto(Vec<u8>),
 }
 
 /// What the last transmitted burst contained (for logging).
@@ -132,6 +201,10 @@ pub struct LinkStats {
     pub bytes_delivered: u64,
     pub codewords_received: u64,
     pub codewords_failed: u64,
+    /// Unproto frames sent, received, and dropped (too long, or the queue was full).
+    pub unproto_sent: u64,
+    pub unproto_received: u64,
+    pub unproto_dropped: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -201,6 +274,23 @@ pub struct Link {
     closed: Option<(u8, String, f64)>,
     last_tx: TxInfo,
     pub stats: LinkStats,
+    unproto: Unproto,
+}
+
+/// Unproto frames waiting to go out, and the channel-access state for them.
+#[derive(Default)]
+struct Unproto {
+    queue: VecDeque<Vec<u8>>,
+    bytes: usize,
+    /// When the first frame of the next burst and the newest frame arrived.
+    first_in: f64,
+    last_in: f64,
+    /// Since when the channel has been clear (None while busy).
+    clear_since: Option<f64>,
+    /// How long the channel must be clear before the next burst (drawn per burst).
+    wait: Option<f64>,
+    /// An Unproto burst is on the air.
+    sending: bool,
 }
 
 fn norm_call(c: &str) -> String {
@@ -223,6 +313,7 @@ impl Link {
             closed: None,
             last_tx: TxInfo::default(),
             stats: LinkStats::default(),
+            unproto: Unproto::default(),
         }
     }
 
@@ -323,6 +414,37 @@ impl Link {
         }
     }
 
+    /// A frame for an Unproto burst (from the KISS port): queued, and sent once no
+    /// session is active or being set up and the channel has been clear for
+    /// [`UNPROTO_CLEAR_S`] plus a random wait. Frames that arrive within
+    /// [`UNPROTO_BATCH_S`] of each other share a burst, as far as they fit, and
+    /// always go out in the order they arrived. Returns false if the frame is
+    /// empty or longer than [`unproto_max_frame`] (it is dropped).
+    pub fn send_unproto(&mut self, now: f64, frame: &[u8]) -> bool {
+        if frame.is_empty() || frame.len() > unproto_max_frame(&self.modem) {
+            self.stats.unproto_dropped += 1;
+            return false;
+        }
+        let u = &mut self.unproto;
+        if u.queue.is_empty() {
+            u.first_in = now;
+        }
+        u.last_in = now;
+        u.bytes += frame.len();
+        u.queue.push_back(frame.to_vec());
+        while u.queue.len() > UNPROTO_QUEUE_FRAMES || u.bytes > UNPROTO_QUEUE_BYTES {
+            let old = u.queue.pop_front().unwrap();
+            u.bytes -= old.len();
+            self.stats.unproto_dropped += 1;
+        }
+        true
+    }
+
+    /// Unproto frames waiting to be sent.
+    pub fn unproto_queued(&self) -> usize {
+        self.unproto.queue.len()
+    }
+
     fn close(&mut self) {
         if let State::Connected(s) = &self.state {
             self.closed = Some((s.id, s.local.clone(), 0.0));
@@ -345,6 +467,14 @@ impl Link {
         let h = rx.header;
         self.stats.codewords_received += rx.payload.len() as u64;
         self.stats.codewords_failed += rx.payload.iter().filter(|p| p.is_none()).count() as u64;
+        if h.kind == Kind::Unproto {
+            // For every station, whatever its state; it never touches a session.
+            for f in parse_unproto(&rx.payload) {
+                self.stats.unproto_received += 1;
+                self.events.push(LinkEvent::Unproto(f));
+            }
+            return;
+        }
         let req = self.level_for(rx);
         let turnaround = self.cfg.turnaround_s;
 
@@ -548,8 +678,13 @@ impl Link {
         }
         let cfg = self.cfg.clone();
         let backoff = self.rand_s(0.4);
+        match (busy, self.unproto.clear_since) {
+            (true, _) => self.unproto.clear_since = None,
+            (false, None) => self.unproto.clear_since = Some(now),
+            (false, Some(_)) => {}
+        }
         match &mut self.state {
-            State::Idle => None,
+            State::Idle => self.poll_unproto(now, busy),
             State::Connecting { session, mycall, target, attempts, next_tx, sending } => {
                 if *sending {
                     return None;
@@ -654,8 +789,65 @@ impl Link {
         }
     }
 
+    /// The next Unproto burst, if one is due. Called only in `State::Idle`.
+    fn poll_unproto(&mut self, now: f64, busy: bool) -> Option<Burst> {
+        let u = &self.unproto;
+        if u.queue.is_empty() || u.sending || busy {
+            return None;
+        }
+        if now < (u.last_in + UNPROTO_BATCH_S).min(u.first_in + UNPROTO_BATCH_MAX_S) {
+            return None;
+        }
+        let wait = match u.wait {
+            Some(w) => w,
+            None => {
+                let w = UNPROTO_CLEAR_S + self.rand_s(UNPROTO_CLEAR_RANDOM_S);
+                self.unproto.wait = Some(w);
+                w
+            }
+        };
+        let u = &mut self.unproto;
+        if u.clear_since.is_none_or(|t| now < t + wait) {
+            return None;
+        }
+        // Level 0 unless the first frame only fits at level 1. Frames are taken in
+        // order while they fit; the rest wait for the next burst.
+        let first = 2 + u.queue[0].len();
+        let level = *UNPROTO_LEVELS.iter().find(|&&l| first <= unproto_capacity(&self.modem, l)).unwrap();
+        let cap = unproto_capacity(&self.modem, level);
+        let mut frames = Vec::new();
+        let mut used = 0;
+        while let Some(f) = u.queue.front() {
+            if used + 2 + f.len() > cap {
+                break;
+            }
+            used += 2 + f.len();
+            let f = u.queue.pop_front().unwrap();
+            u.bytes -= f.len();
+            frames.push(f);
+        }
+        // What is left goes in the next burst without another batching wait.
+        u.first_in = now - UNPROTO_BATCH_MAX_S;
+        u.sending = true;
+        u.wait = None;
+        let payload = pack_unproto(level, &frames);
+        let header = Header { kind: Kind::Unproto, level, ncw: payload.len() as u8, ..Header::default() };
+        let bytes = frames.iter().map(Vec::len).sum();
+        self.stats.unproto_sent += frames.len() as u64;
+        self.stats.bursts_sent += 1;
+        self.stats.payload_bytes_sent += bytes as u64;
+        self.last_tx = TxInfo { kind: Kind::Unproto, level, ncw: payload.len(), bytes, ..TxInfo::default() };
+        Some(Burst { header, payload })
+    }
+
     /// Called when the burst returned by `poll` has finished transmitting.
     pub fn tx_done(&mut self, now: f64) {
+        if std::mem::take(&mut self.unproto.sending) {
+            // The next Unproto burst waits for a clear channel again, which gives
+            // other stations a chance to get in between.
+            self.unproto.clear_since = Some(now);
+            return;
+        }
         let timeout = self.cfg.response_timeout_s;
         match &mut self.state {
             State::Connecting { next_tx, sending, .. } => {

@@ -2,12 +2,14 @@
 //!
 //! - [`host`]: the VARA-compatible command protocol.
 //! - [`server`]: TCP command and data ports.
+//! - [`kiss`]: KISS-over-TCP port for unconnected broadcast (Unproto) frames.
 //! - [`station`]: one modem (link + modulator + receiver) with its host notifications.
 //! - [`simpair`]: two stations connected by a simulated FM radio link.
 //! - [`radio`]: one station on a real radio (sound card + PTT).
 //! - [`level`]: receive level meter and volume advice.
 
 pub mod host;
+pub mod kiss;
 pub mod level;
 pub mod radio;
 pub mod server;

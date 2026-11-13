@@ -41,6 +41,9 @@ pub struct SimPairConfig {
     /// Command ports of A and B (data = command + 1). 0 = pick free ports.
     pub a_port: u16,
     pub b_port: u16,
+    /// KISS ports of A and B (None = no KISS port, 0 = pick a free port).
+    pub a_kiss_port: Option<u16>,
+    pub b_kiss_port: Option<u16>,
     /// Save every transmission as WAV files in this folder.
     pub record: Option<PathBuf>,
     /// Print one line per transmission and reception.
@@ -60,6 +63,8 @@ impl Default for SimPairConfig {
             host: "127.0.0.1".into(),
             a_port: 8300,
             b_port: 8310,
+            a_kiss_port: None,
+            b_kiss_port: None,
             record: None,
             verbose: true,
         }
@@ -79,6 +84,8 @@ pub struct SimPairStats {
 pub struct SimPair {
     /// (command, data) addresses of A and B.
     pub addrs: [(SocketAddr, SocketAddr); 2],
+    /// KISS addresses of A and B, where enabled.
+    pub kiss_addrs: [Option<SocketAddr>; 2],
     stats: Arc<Mutex<SimPairStats>>,
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
@@ -91,10 +98,11 @@ impl SimPair {
         let channel = FmChannelConfig::by_name(&cfg.mode).unwrap();
         let data_port = |p: u16| if p == 0 { 0 } else { p + 1 };
         let ports = [
-            HostPort::bind(&cfg.host, cfg.a_port, data_port(cfg.a_port))?,
-            HostPort::bind(&cfg.host, cfg.b_port, data_port(cfg.b_port))?,
+            HostPort::bind_with_kiss(&cfg.host, cfg.a_port, data_port(cfg.a_port), cfg.a_kiss_port)?,
+            HostPort::bind_with_kiss(&cfg.host, cfg.b_port, data_port(cfg.b_port), cfg.b_kiss_port)?,
         ];
         let addrs = [(ports[0].cmd_addr, ports[0].data_addr), (ports[1].cmd_addr, ports[1].data_addr)];
+        let kiss_addrs = [ports[0].kiss_addr(), ports[1].kiss_addr()];
         if let Some(dir) = &cfg.record {
             std::fs::create_dir_all(dir)?;
         }
@@ -123,7 +131,7 @@ impl SimPair {
             cfg,
         };
         let handle = thread::spawn(move || engine.run());
-        Ok(Self { addrs, stats, stop, handle: Some(handle) })
+        Ok(Self { addrs, kiss_addrs, stats, stop, handle: Some(handle) })
     }
 
     pub fn stats(&self) -> SimPairStats {
@@ -198,6 +206,7 @@ impl Engine {
                         HostIn::Line(l) => self.stations[i].host_line(now, &l),
                         HostIn::Data(d) => self.stations[i].host_data(&d),
                         HostIn::CmdClosed => self.stations[i].host_closed(now),
+                        HostIn::Kiss(f) => self.stations[i].kiss_in(now, &f),
                     }
                 }
                 self.stations[i].tick(now);
@@ -253,6 +262,7 @@ impl Engine {
                     match o {
                         HostOut::Line(l) => self.ports[i].send_line(&l),
                         HostOut::Data(d) => self.ports[i].send_data(&d),
+                        HostOut::Kiss(f) => self.ports[i].send_kiss(&f),
                     }
                 }
             }

@@ -117,6 +117,7 @@ impl HostSide {
             match o {
                 HostOut::Line(l) => self.lines.push(l),
                 HostOut::Data(d) => self.data.extend(d),
+                HostOut::Kiss(_) => {}
             }
         }
     }

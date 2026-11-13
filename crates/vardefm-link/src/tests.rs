@@ -321,3 +321,153 @@ fn predicted_snr_matches_the_simulator() {
     let p = modem.predict_snr_db(15.9, 4, 5);
     assert!((p - 15.3).abs() < 1.0, "narrow L4 -> L5 at 14 dB CNR: {p:.1}");
 }
+
+// ------------------------------------------------------------------ Unproto
+
+fn lone_link(seed: u32) -> Link {
+    Link::new(Arc::new(Modem::new(OfdmParams::narrow(), 0.1)), LinkConfig::default(), seed)
+}
+
+/// Poll a lone link (quiet channel unless `busy` says otherwise) from `from` until it
+/// transmits or `until` passes. Returns (time, burst).
+fn poll_until(link: &mut Link, from: f64, until: f64, busy: impl Fn(f64) -> bool) -> Option<(f64, Burst)> {
+    let mut t = from;
+    while t < until {
+        if let Some(b) = link.poll(t, busy(t)) {
+            return Some((t, b));
+        }
+        t += DT;
+    }
+    None
+}
+
+fn rx_of(b: &Burst) -> RxBurst {
+    let payload = b.payload.iter().cloned().map(Some).collect();
+    RxBurst { header: b.header, payload, snr_db: 20.0, end_sample: 0, level: Default::default() }
+}
+
+fn unproto_events(l: &mut Link) -> Vec<Vec<u8>> {
+    l.take_events().into_iter().filter_map(|e| if let LinkEvent::Unproto(f) = e { Some(f) } else { None }).collect()
+}
+
+#[test]
+fn unproto_pack_parse_roundtrip_and_failed_codewords() {
+    let frames: Vec<Vec<u8>> = (0..5).map(|i| data(40 + 30 * i, i as u32)).collect();
+    let cws = pack_unproto(0, &frames);
+    assert!(cws.iter().all(|c| c.len() == Modem::payload_bytes(0)));
+    assert_eq!(cws.len(), 4, "1 + 5 x 2 + 500 = 511 bytes in 146-byte codewords");
+    let ok: Vec<_> = cws.iter().cloned().map(Some).collect();
+    assert_eq!(parse_unproto(&ok), frames);
+    // A failed codeword loses the frames it touches and everything after it.
+    let mut bad = ok.clone();
+    bad[1] = None;
+    let got = parse_unproto(&bad);
+    let in_first: usize = frames
+        .iter()
+        .scan(1, |pos, f| {
+            *pos += 2 + f.len();
+            Some(*pos)
+        })
+        .take_while(|&e| e <= 146)
+        .count();
+    assert_eq!(got, frames[..in_first]);
+    bad[0] = None;
+    assert!(parse_unproto(&bad).is_empty());
+    // Unknown format version: nothing.
+    let mut other = ok;
+    other[0].as_mut().unwrap()[0] = 2;
+    assert!(parse_unproto(&other).is_empty());
+}
+
+#[test]
+fn unproto_capacity_per_mode() {
+    for (mode, l0, l1) in [("narrow", 291, 729), ("wide", 875, 1897)] {
+        let m = Modem::new(OfdmParams::by_name(mode).unwrap(), 0.1);
+        assert_eq!((unproto_capacity(&m, 0), unproto_capacity(&m, 1)), (l0, l1), "{mode}");
+        assert_eq!(unproto_max_frame(&m), l1 - 2);
+    }
+}
+
+#[test]
+fn unproto_frames_within_the_batch_window_share_a_burst_in_order() {
+    let mut l = lone_link(1);
+    let f: Vec<Vec<u8>> = (0..4).map(|i| vec![0x00, i as u8, 0xc0, 0xdb]).collect();
+    assert!(l.send_unproto(5.0, &f[0]));
+    assert!(l.send_unproto(5.2, &f[1])); // 0.2 s later: same batch
+    assert!(l.send_unproto(5.45, &f[2])); // 0.25 s after the last: still the same batch
+    let (t, b) = poll_until(&mut l, 0.0, 10.0, |_| false).expect("sent");
+    assert!(t >= 5.45 + UNPROTO_BATCH_S - 1e-9, "sent at {t} before the batch window closed");
+    assert_eq!((b.header.kind, b.header.level, b.header.ncw), (Kind::Unproto, 0, 1));
+    assert_eq!(parse_unproto(&rx_of(&b).payload), f[..3]);
+    l.tx_done(t + 1.0);
+    // A frame after the burst goes in a burst of its own, after a fresh clear wait.
+    l.send_unproto(t + 1.0, &f[3]);
+    let (t2, b2) = poll_until(&mut l, t + 1.0, t + 10.0, |_| false).expect("sent");
+    assert!(t2 >= t + 1.0 + UNPROTO_CLEAR_S - 1e-9);
+    assert_eq!(parse_unproto(&rx_of(&b2).payload), f[3..]);
+    assert_eq!(l.stats.unproto_sent, 4);
+}
+
+#[test]
+fn unproto_waits_for_a_clear_channel() {
+    for seed in 0..20 {
+        let mut l = lone_link(seed);
+        l.send_unproto(0.0, &[0x00, 1, 2, 3]);
+        // Busy until 3 s: nothing before 3.5 s, and it goes by 4.0 s.
+        let (t, _) = poll_until(&mut l, 0.0, 10.0, |t| t < 3.0).expect("sent");
+        assert!(
+            (3.0 + UNPROTO_CLEAR_S..=3.0 + UNPROTO_CLEAR_S + UNPROTO_CLEAR_RANDOM_S + 2.0 * DT).contains(&t),
+            "seed {seed}: sent at {t}"
+        );
+    }
+}
+
+#[test]
+fn unproto_long_frame_uses_level_1_and_too_long_is_dropped() {
+    let mut l = lone_link(2);
+    let m = Modem::new(OfdmParams::narrow(), 0.1);
+    let big = vec![0x00; unproto_capacity(&m, 0)]; // does not fit level 0 with its length
+    assert!(l.send_unproto(0.0, &big));
+    assert!(l.send_unproto(0.0, &[0x00, 9]));
+    let (t, b) = poll_until(&mut l, 0.0, 10.0, |_| false).unwrap();
+    assert_eq!(b.header.level, 1);
+    assert_eq!(parse_unproto(&rx_of(&b).payload), vec![big, vec![0x00, 9]]);
+    l.tx_done(t + 4.0);
+    assert!(!l.send_unproto(t, &vec![0x00; unproto_max_frame(&m) + 1]));
+    assert!(!l.send_unproto(t, &[]));
+    assert_eq!(l.stats.unproto_dropped, 2);
+}
+
+#[test]
+fn unproto_is_held_during_a_session_and_received_in_any_state() {
+    let mut net = Net::new(40, 0.0, 0.0);
+    net.nodes[0].link.connect(0.0, "LA1AAA", "LA2BBB-1").unwrap();
+    net.run_until(60.0, |n| n.nodes[0].link.is_connected() && n.nodes[1].link.is_connected());
+    net.nodes[0].link.send_unproto(net.now, &[0x00, 0xaa]);
+    net.nodes[0].link.send_data(&data(2000, 3));
+    net.run_until(300.0, |n| n.nodes[1].host_rx.len() >= 2000);
+    net.run_until(60.0, |n| n.has(0, &LinkEvent::Buffer(0)));
+    for _ in 0..1000 {
+        net.step(); // 10 s with the session up and quiet
+    }
+    assert_eq!(net.nodes[0].link.unproto_queued(), 1, "sent during the session");
+    assert_eq!(net.nodes[0].link.stats.unproto_sent, 0);
+
+    // A burst from a third station reaches B mid-session and leaves the session alone.
+    let mut c = lone_link(77);
+    c.send_unproto(0.0, &[0x01, 1, 2, 3]);
+    let (_, burst) = poll_until(&mut c, 0.0, 10.0, |_| false).unwrap();
+    let before = (net.nodes[1].link.stats.bursts_sent, net.nodes[1].link.is_connected());
+    net.nodes[1].link.on_burst(net.now, &rx_of(&burst));
+    assert_eq!(unproto_events(&mut net.nodes[1].link), vec![vec![0x01, 1, 2, 3]]);
+    for _ in 0..100 {
+        net.step();
+    }
+    assert_eq!((net.nodes[1].link.stats.bursts_sent, net.nodes[1].link.is_connected()), before, "B answered it");
+
+    net.nodes[0].link.disconnect(net.now);
+    net.run_until(60.0, |n| n.nodes[0].link.is_idle() && n.nodes[1].link.is_idle());
+    net.run_until(10.0, |n| n.nodes[0].link.stats.unproto_sent == 1);
+    // And B, idle now, received it.
+    net.run_until(10.0, |n| n.nodes[1].events.contains(&LinkEvent::Unproto(vec![0x00, 0xaa])));
+}
