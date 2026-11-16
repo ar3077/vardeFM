@@ -93,6 +93,12 @@ pub struct LinkConfig {
     /// Extra wait per digipeater hop, beyond airtime and turnaround: a digipeater's
     /// decoding time, PTT/VOX key-up and squelch tail.
     pub hop_margin_s: f64,
+    /// Drop the session once the channel has stayed busy this long while we have neither
+    /// transmitted nor heard the peer. A busy channel holds back our retries, so without
+    /// this a carrier or another station's traffic could keep a dead session open forever.
+    /// The link never uses less than the longest time an exchange with the peer can keep
+    /// the channel busy, so the peer's own bursts and their repeats cannot trigger it.
+    pub busy_timeout_s: f64,
 }
 
 impl Default for LinkConfig {
@@ -107,6 +113,7 @@ impl Default for LinkConfig {
             start_level: 1,
             max_level: LEVELS.len() as u8 - 1,
             hop_margin_s: 0.5,
+            busy_timeout_s: 60.0,
         }
     }
 }
@@ -265,6 +272,9 @@ pub struct Link {
     closed: Option<(u8, Route)>,
     /// Longest burst any level can send, seconds.
     max_burst_s: f64,
+    /// When the channel turned busy, if it has stayed busy (as `poll` saw it) since, and
+    /// we have not transmitted since.
+    busy_since: Option<f64>,
     last_tx: TxInfo,
     pub stats: LinkStats,
 }
@@ -290,6 +300,7 @@ impl Link {
             rng: Prng::new(seed),
             oneshot: None,
             closed: None,
+            busy_since: None,
             last_tx: TxInfo::default(),
             stats: LinkStats::default(),
         }
@@ -380,6 +391,15 @@ impl Link {
         } else {
             self.cfg.keepalive_s.max(2.0 * self.retry_wait(hops, false, 0.0))
         }
+    }
+
+    /// How long a busy channel may hold back a session whose peer we do not hear.
+    /// The configured value, but at least the peer's longest burst plus two of the
+    /// called station's longest retry waits: through digipeaters the channel can stay
+    /// busy from our burst's repeats through the peer's answer and its repeats before
+    /// we decode the answer. A non-finite or negative setting gives the minimum.
+    fn busy_timeout_s(&self, hops: u8) -> f64 {
+        self.cfg.busy_timeout_s.max(self.max_burst_s + 2.0 * self.retry_wait(hops, false, 0.0))
     }
 
     // ------------------------------------------------------------ host commands
@@ -692,10 +712,12 @@ impl Link {
         }
         let cfg = self.cfg.clone();
         let backoff = self.rand_s(RETRY_BACKOFF_S);
-        let keepalive = match &self.state {
-            State::Connected(s) => self.keepalive_s(s.route.hops()),
-            _ => cfg.keepalive_s,
+        let (keepalive, busy_timeout) = match &self.state {
+            State::Connected(s) => (self.keepalive_s(s.route.hops()), self.busy_timeout_s(s.route.hops())),
+            _ => (cfg.keepalive_s, f64::INFINITY),
         };
+        self.busy_since = if busy { Some(self.busy_since.unwrap_or(now)) } else { None };
+        let busy_for = self.busy_since.map_or(0.0, |t| now - t);
         match &mut self.state {
             State::Idle => None,
             State::Connecting { session, mycall, target, digis, attempts, next_tx, sending } => {
@@ -733,6 +755,14 @@ impl Link {
                 Some(burst)
             }
             State::Connected(s) => {
+                // A busy channel holds back everything we would start ourselves: retries,
+                // keepalives, a pending Disc. If it stays busy and the peer is not among
+                // those talking, give up rather than wait for the channel forever.
+                let stalled = busy_for > busy_timeout && now - s.last_heard > busy_timeout;
+                if stalled && !matches!(s.phase, Phase::Sending { .. }) {
+                    self.close();
+                    return None;
+                }
                 // Advance timers.
                 match s.phase {
                     Phase::Sending { .. } => return None,
@@ -813,6 +843,8 @@ impl Link {
 
     /// Called when the burst returned by `poll` has finished transmitting.
     pub fn tx_done(&mut self, now: f64) {
+        // We got on the air, so the channel did not hold us back.
+        self.busy_since = None;
         let timeout = self.cfg.response_timeout_s;
         let connect_s = self.modem.burst_seconds(0, 1) as f64;
         // Draw the retry jitter only while connecting, as before digipeating, so direct
