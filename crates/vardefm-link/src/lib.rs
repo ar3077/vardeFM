@@ -93,13 +93,17 @@ pub struct LinkConfig {
     /// Extra wait per digipeater hop, beyond airtime and turnaround: a digipeater's
     /// decoding time, PTT/VOX key-up and squelch tail.
     pub hop_margin_s: f64,
-    /// Drop the session once the channel has stayed busy this long while we have neither
-    /// transmitted nor heard the peer. A busy channel holds back our retries, so without
-    /// this a carrier or another station's traffic could keep a dead session open forever.
-    /// The link never uses less than the longest time an exchange with the peer can keep
-    /// the channel busy, so the peer's own bursts and their repeats cannot trigger it; a
-    /// smaller, negative or NaN setting gives that minimum. `f64::INFINITY` turns the
-    /// drop off.
+    /// Drop the session once the channel has stayed busy this long without a break and
+    /// without us transmitting, and the peer has been silent both this long and past
+    /// its keepalive interval (an idle session holds nothing back before then). A busy
+    /// channel holds back our retries, so without this a carrier or another station's
+    /// traffic could keep a dead session open forever.
+    ///
+    /// The link raises a smaller value to a floor chosen to cover an exchange with the
+    /// peer through the session's digipeaters (the longest burst plus two of the called
+    /// station's longest retry waits), so that the peer's own bursts and their repeats do
+    /// not trigger it; 0 means "use the floor". `f64::INFINITY` turns the drop off.
+    /// [`Link::new`] panics on a negative or NaN value.
     pub busy_timeout_s: f64,
 }
 
@@ -286,7 +290,13 @@ fn norm_call(c: &str) -> String {
 }
 
 impl Link {
+    /// Panics if `cfg.busy_timeout_s` is negative or NaN.
     pub fn new(modem: Arc<Modem>, cfg: LinkConfig, seed: u32) -> Self {
+        assert!(
+            cfg.busy_timeout_s >= 0.0,
+            "LinkConfig::busy_timeout_s must be 0 or more (or infinite), got {}",
+            cfg.busy_timeout_s
+        );
         let max_burst_s =
             (0..LEVELS.len() as u8).map(|l| modem.burst_seconds(l, modem.max_ncw(l)) as f64).fold(0.0, f64::max);
         Self {
@@ -397,10 +407,9 @@ impl Link {
 
     /// How long a busy channel may hold back a session whose peer we do not hear.
     /// The configured value, but at least the peer's longest burst plus two of the
-    /// called station's longest retry waits: through digipeaters the channel can stay
-    /// busy from our burst's repeats through the peer's answer and its repeats before
-    /// we decode the answer. A smaller, negative or NaN setting gives that minimum
-    /// (`f64::max` ignores NaN); `f64::INFINITY` turns the drop off.
+    /// called station's longest retry waits, a floor chosen to cover the channel staying
+    /// busy from our burst's repeats through the peer's answer and its repeats before we
+    /// decode the answer. `f64::INFINITY` turns the drop off.
     fn busy_timeout_s(&self, hops: u8) -> f64 {
         self.cfg.busy_timeout_s.max(self.max_burst_s + 2.0 * self.retry_wait(hops, false, 0.0))
     }

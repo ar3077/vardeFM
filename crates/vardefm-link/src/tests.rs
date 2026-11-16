@@ -884,18 +884,43 @@ fn infinite_busy_timeout_never_drops() {
 }
 
 #[test]
-fn busy_timeout_setting_falls_back_to_the_floor() {
+fn busy_timeout_setting_is_raised_to_a_floor_and_bad_values_rejected() {
     let modem = Arc::new(Modem::new(OfdmParams::narrow(), 0.1));
-    let with = |s: f64| Link::new(modem.clone(), LinkConfig { busy_timeout_s: s, ..LinkConfig::default() }, 1);
+    let cfg = |s: f64| LinkConfig { busy_timeout_s: s, ..LinkConfig::default() };
+    let with = |s: f64| Link::new(modem.clone(), cfg(s), 1);
+    let mut last = 0.0;
     for hops in 0..=MAX_DIGIS as u8 {
-        let l = with(0.0);
-        let floor = l.max_burst_s + 2.0 * l.retry_wait(hops, false, 0.0);
-        for s in [0.0, -5.0, f64::NAN, f64::NEG_INFINITY, floor - 1.0] {
-            assert_eq!(with(s).busy_timeout_s(hops), floor, "setting {s}, hops {hops}");
-        }
+        // 0 gives the floor: more than a burst, and longer with every hop.
+        let floor = with(0.0).busy_timeout_s(hops);
+        assert!(floor > with(0.0).max_burst_s && floor > last, "hops {hops}: {floor}");
+        last = floor;
+        assert_eq!(with(floor / 2.0).busy_timeout_s(hops), floor);
         assert_eq!(with(floor + 100.0).busy_timeout_s(hops), floor + 100.0);
         assert_eq!(with(f64::INFINITY).busy_timeout_s(hops), f64::INFINITY);
     }
+    for bad in [-1.0, f64::NEG_INFINITY, f64::NAN] {
+        let m = modem.clone();
+        let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Link::new(m, cfg(bad), 1)));
+        assert!(made.is_err(), "busy_timeout_s {bad} accepted");
+    }
+}
+
+#[test]
+fn idle_session_survives_a_busy_channel_until_its_keepalive_is_due() {
+    // Neither end has anything to send, and other stations hold the channel for longer
+    // than the busy timeout. Nothing is held back until the keepalive is due, so the
+    // session must stay up.
+    let cfg = LinkConfig { busy_timeout_s: 0.0, keepalive_s: 300.0, ..LinkConfig::default() };
+    let mut net = Net::chain(71, 0.0, &[], cfg);
+    net.nodes[A].link.connect(0.0, "LA1AAA", "LA2BBB-1", &[]).unwrap();
+    net.run_until(60.0, |n| n.both_connected());
+    net.run_until(10.0, |n| n.nodes.iter().all(|x| x.tx.is_none()));
+    let busy_timeout = net.nodes[A].link.busy_timeout_s(0);
+    let (start, end) = (net.now, net.now + 2.0 * busy_timeout);
+    net.history.push((1, start, end));
+    net.run_until(3.0 * busy_timeout, |n| n.now > end + 2.0);
+    assert!(net.both_connected());
+    assert!(!net.has(A, &LinkEvent::Disconnected));
 }
 
 #[test]
@@ -931,27 +956,27 @@ fn busy_timer_restarts_on_a_quiet_gap_or_our_burst_and_spares_a_burst_on_air() {
     net.nodes[A].link.send_data(&data(100, 70));
     net.run_until(10.0, |n| n.nodes[A].tx.is_some());
     let link = &mut net.nodes[A].link;
+    let bt = link.busy_timeout_s(0);
     let t = net.now + 1000.0; // the peer is long silent
-    let limit = link.busy_timeout_s(0) + 1.0;
-    // Our burst is on the air: a long busy stretch does not drop the session.
+                              // Our burst is on the air: a long busy stretch does not drop the session.
     assert!(link.poll(t, true).is_none());
-    assert!(link.poll(t + limit, true).is_none());
+    assert!(link.poll(t + bt + 1.0, true).is_none());
     assert!(link.is_connected());
-    // Our burst ends: the busy stretch starts again from zero.
-    link.tx_done(t + limit);
-    assert_eq!(link.busy_since, None);
-    link.poll(t + limit, true);
-    link.poll(t + limit + 1.0, true);
+    // Our burst ends, so the busy stretch starts again from zero. We now wait for the
+    // answer with a retry pending, which the busy channel holds back.
+    let t = t + bt + 1.0;
+    link.tx_done(t);
+    link.poll(t + 0.01, true);
+    link.poll(t + 0.9 * bt, true);
     assert!(link.is_connected());
-    // Unbroken, it drops.
-    link.poll(t + 2.0 * limit + 1.0, true);
+    // A quiet moment (before the retry is due) restarts it too: two busy stretches
+    // just under the timeout each, together well over it.
+    assert!(link.poll(t + 0.9 * bt + 0.1, false).is_none());
+    link.poll(t + 0.9 * bt + 0.2, true);
+    link.poll(t + 1.8 * bt, true);
+    assert!(link.is_connected());
+    // Unbroken past the timeout, it drops.
+    link.poll(t + 2.0 * bt + 0.3, true);
     assert!(!link.is_connected());
     assert!(link.take_events().contains(&LinkEvent::Disconnected));
-    // A quiet moment restarts it.
-    let t = t + 3.0 * limit;
-    link.poll(t + 1.0, false);
-    assert_eq!(link.busy_since, None);
-    link.poll(t + 2.0, true);
-    link.poll(t + 3.0, true);
-    assert_eq!(link.busy_since, Some(t + 2.0));
 }
