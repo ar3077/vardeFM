@@ -342,6 +342,19 @@ impl Link {
         &self.last_tx
     }
 
+    /// We finished a transmission of our own that did not come from `poll`, such as a
+    /// digipeater repeat. We got on the air, so the channel did not hold us back: the
+    /// busy-channel timer starts again. `tx_done` does the same for our own bursts.
+    pub fn note_own_tx(&mut self) {
+        self.busy_since = None;
+    }
+
+    /// When the channel turned busy, if it has stayed busy as `poll` saw it and we have
+    /// not transmitted since.
+    pub fn busy_since(&self) -> Option<f64> {
+        self.busy_since
+    }
+
     pub fn take_events(&mut self) -> Vec<LinkEvent> {
         let buf = match &self.state {
             State::Connected(s) => s.tx_buf.len(),
@@ -858,8 +871,7 @@ impl Link {
 
     /// Called when the burst returned by `poll` has finished transmitting.
     pub fn tx_done(&mut self, now: f64) {
-        // We got on the air, so the channel did not hold us back.
-        self.busy_since = None;
+        self.note_own_tx();
         let timeout = self.cfg.response_timeout_s;
         let connect_s = self.modem.burst_seconds(0, 1) as f64;
         // Draw the retry jitter only while connecting, as before digipeating, so direct

@@ -169,7 +169,10 @@ impl Station {
     pub fn tx_done(&mut self, now: f64) {
         self.transmitting = false;
         self.line("PTT OFF");
-        if !std::mem::take(&mut self.repeating) {
+        if std::mem::take(&mut self.repeating) {
+            // A repeat is our transmission too: it restarts the link's busy timer.
+            self.link.note_own_tx();
+        } else {
             self.link.tx_done(now);
         }
     }
@@ -214,5 +217,25 @@ impl Station {
             self.out.push(o);
         }
         std::mem::take(&mut self.out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vardefm_modem::OfdmParams;
+
+    #[test]
+    fn a_digipeater_repeat_restarts_the_links_busy_timer() {
+        let modem = Arc::new(Modem::new(OfdmParams::narrow(), 0.1));
+        let mut st = Station::new("D", modem, LinkConfig::default(), 1);
+        st.set_digi(&["LA3DDD".to_string()]);
+        assert!(st.link.poll(10.0, true).is_none());
+        assert_eq!(st.link.busy_since(), Some(10.0));
+        // A repeat goes out and ends; the link never saw it through `poll`.
+        st.transmitting = true;
+        st.repeating = true;
+        st.tx_done(12.0);
+        assert_eq!(st.link.busy_since(), None);
     }
 }

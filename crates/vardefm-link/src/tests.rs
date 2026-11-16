@@ -825,8 +825,8 @@ fn longer_resend_of_a_stored_segment_is_kept() {
 /// Connects A to B through `digis`, silences B, and once A's next burst is over keys
 /// up a carrier at A's neighbour that never ends. If `disc`, A's host then asks to
 /// disconnect, so a Disc is pending too. Returns how long A took to drop the session,
-/// or None if it was still connected after 900 s.
-fn jammed_with(seed: u32, digis: &[&str], disc: bool, cfg: LinkConfig) -> Option<f64> {
+/// or None if it was still connected after 900 s, and the latest A should have dropped.
+fn jammed_with(seed: u32, digis: &[&str], disc: bool, cfg: LinkConfig) -> (Option<f64>, f64) {
     let mut net = Net::chain(seed, 0.0, digis, cfg);
     let b = net.b();
     net.nodes[A].link.connect(0.0, "LA1AAA", "LA2BBB-1", &via(digis)).unwrap();
@@ -845,17 +845,17 @@ fn jammed_with(seed: u32, digis: &[&str], disc: bool, cfg: LinkConfig) -> Option
     while !net.has(A, &LinkEvent::Disconnected) && net.now - t0 < 900.0 {
         net.step();
     }
-    net.has(A, &LinkEvent::Disconnected).then_some(net.now - t0)
+    // The latest A may drop: its busy timeout, or its keepalive when that is longer.
+    let (link, hops) = (&net.nodes[A].link, digis.len() as u8);
+    let limit = link.busy_timeout_s(hops).max(link.keepalive_s(hops));
+    (net.has(A, &LinkEvent::Disconnected).then_some(net.now - t0), limit)
 }
 
 /// As `jammed_with` on the default config, and checks A dropped no later than the busy
 /// timeout for its route (or its keepalive, when that is longer) plus some slack.
 fn jammed(seed: u32, digis: &[&str], disc: bool) {
-    let t = jammed_with(seed, digis, disc, LinkConfig::default());
+    let (t, limit) = jammed_with(seed, digis, disc, LinkConfig::default());
     let t = t.unwrap_or_else(|| panic!("A still in session after 900 s on a jammed channel via {digis:?}"));
-    let link = Link::new(Arc::new(Modem::new(OfdmParams::narrow(), 0.1)), LinkConfig::default(), 1);
-    let hops = digis.len() as u8;
-    let limit = link.busy_timeout_s(hops).max(link.keepalive_s(hops));
     assert!(t < limit + 5.0, "via {digis:?}, disc {disc}: took {t:.0} s, limit {limit:.0} s");
 }
 
@@ -880,7 +880,7 @@ fn routed_retry_and_pending_disc_give_up_on_a_jammed_channel() {
 #[test]
 fn infinite_busy_timeout_never_drops() {
     let cfg = LinkConfig { busy_timeout_s: f64::INFINITY, ..LinkConfig::default() };
-    assert_eq!(jammed_with(1, &[], false, cfg), None);
+    assert_eq!(jammed_with(1, &[], false, cfg).0, None);
 }
 
 #[test]
