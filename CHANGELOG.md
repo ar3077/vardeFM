@@ -6,8 +6,8 @@ run the same minor version.
 
 ## [Unreleased]
 
-This build is versioned `0.3.1-ortoo.1`: upstream master plus unconnected broadcasts for
-Ortoo. It is on-air compatible with 0.3.0 and 0.3.1. Sessions are unchanged, and older
+This build is versioned `0.3.1-ortoo.2`: upstream master plus unconnected broadcasts and
+S/N reports for Ortoo. It is on-air compatible with 0.3.0 and 0.3.1. Sessions are unchanged, and older
 stations ignore the new burst kind.
 
 ### Added
