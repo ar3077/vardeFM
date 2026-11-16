@@ -97,7 +97,9 @@ pub struct LinkConfig {
     /// transmitted nor heard the peer. A busy channel holds back our retries, so without
     /// this a carrier or another station's traffic could keep a dead session open forever.
     /// The link never uses less than the longest time an exchange with the peer can keep
-    /// the channel busy, so the peer's own bursts and their repeats cannot trigger it.
+    /// the channel busy, so the peer's own bursts and their repeats cannot trigger it; a
+    /// smaller, negative or NaN setting gives that minimum. `f64::INFINITY` turns the
+    /// drop off.
     pub busy_timeout_s: f64,
 }
 
@@ -397,7 +399,8 @@ impl Link {
     /// The configured value, but at least the peer's longest burst plus two of the
     /// called station's longest retry waits: through digipeaters the channel can stay
     /// busy from our burst's repeats through the peer's answer and its repeats before
-    /// we decode the answer. A non-finite or negative setting gives the minimum.
+    /// we decode the answer. A smaller, negative or NaN setting gives that minimum
+    /// (`f64::max` ignores NaN); `f64::INFINITY` turns the drop off.
     fn busy_timeout_s(&self, hops: u8) -> f64 {
         self.cfg.busy_timeout_s.max(self.max_burst_s + 2.0 * self.retry_wait(hops, false, 0.0))
     }
@@ -705,6 +708,7 @@ impl Link {
 
     /// Called regularly while not transmitting. Returns a burst to transmit now.
     pub fn poll(&mut self, now: f64, busy: bool) -> Option<Burst> {
+        self.busy_since = if busy { Some(self.busy_since.unwrap_or(now)) } else { None };
         if let Some(b) = self.oneshot.take() {
             self.last_tx = TxInfo { kind: b.header.kind, ..TxInfo::default() };
             self.stats.bursts_sent += 1;
@@ -716,7 +720,6 @@ impl Link {
             State::Connected(s) => (self.keepalive_s(s.route.hops()), self.busy_timeout_s(s.route.hops())),
             _ => (cfg.keepalive_s, f64::INFINITY),
         };
-        self.busy_since = if busy { Some(self.busy_since.unwrap_or(now)) } else { None };
         let busy_for = self.busy_since.map_or(0.0, |t| now - t);
         match &mut self.state {
             State::Idle => None,
@@ -757,8 +760,13 @@ impl Link {
             State::Connected(s) => {
                 // A busy channel holds back everything we would start ourselves: retries,
                 // keepalives, a pending Disc. If it stays busy and the peer is not among
-                // those talking, give up rather than wait for the channel forever.
-                let stalled = busy_for > busy_timeout && now - s.last_heard > busy_timeout;
+                // those talking, give up rather than wait for the channel forever. An idle
+                // session holds nothing back until its keepalive is due, so the peer must
+                // also have been silent past that. A peer we hear but cannot decode counts
+                // as not heard: `last_heard` moves only on a burst we accept.
+                let keepalive_due = keepalive * if s.route.caller { 1.0 } else { 1.5 };
+                let silent = now - s.last_heard > busy_timeout.max(keepalive_due);
+                let stalled = busy_for > busy_timeout && silent;
                 if stalled && !matches!(s.phase, Phase::Sending { .. }) {
                     self.close();
                     return None;
@@ -806,9 +814,7 @@ impl Link {
                             s.closing.is_some_and(|t| now >= t + cfg.disconnect_grace_s) && s.tx_buf.is_empty();
                         if ready_to_close {
                             s.phase = Phase::Respond { at: now, kind: Kind::Disc, initiated: true };
-                        } else if s.has_data()
-                            || now - s.last_heard > keepalive * if s.route.caller { 1.0 } else { 1.5 }
-                        {
+                        } else if s.has_data() || now - s.last_heard > keepalive_due {
                             // Start a burst on a quiet channel, after a short random wait.
                             s.phase =
                                 Phase::Respond { at: now + 0.05 + backoff * 0.5, kind: Kind::Data, initiated: true };

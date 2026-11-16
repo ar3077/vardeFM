@@ -824,9 +824,10 @@ fn longer_resend_of_a_stored_segment_is_kept() {
 
 /// Connects A to B through `digis`, silences B, and once A's next burst is over keys
 /// up a carrier at A's neighbour that never ends. If `disc`, A's host then asks to
-/// disconnect, so a Disc is pending too. Returns how long A took to drop the session.
-fn jammed(seed: u32, digis: &[&str], disc: bool) -> f64 {
-    let mut net = Net::chain(seed, 0.0, digis, LinkConfig::default());
+/// disconnect, so a Disc is pending too. Returns how long A took to drop the session,
+/// or None if it was still connected after 900 s.
+fn jammed_with(seed: u32, digis: &[&str], disc: bool, cfg: LinkConfig) -> Option<f64> {
+    let mut net = Net::chain(seed, 0.0, digis, cfg);
     let b = net.b();
     net.nodes[A].link.connect(0.0, "LA1AAA", "LA2BBB-1", &via(digis)).unwrap();
     net.run_until(120.0, |n| n.both_connected());
@@ -844,13 +845,18 @@ fn jammed(seed: u32, digis: &[&str], disc: bool) -> f64 {
     while !net.has(A, &LinkEvent::Disconnected) && net.now - t0 < 900.0 {
         net.step();
     }
-    assert!(
-        net.has(A, &LinkEvent::Disconnected),
-        "A still in session after {:.0} s on a jammed channel via {digis:?}; retries {}",
-        net.now - t0,
-        net.nodes[A].link.stats.retries
-    );
-    net.now - t0
+    net.has(A, &LinkEvent::Disconnected).then_some(net.now - t0)
+}
+
+/// As `jammed_with` on the default config, and checks A dropped no later than the busy
+/// timeout for its route (or its keepalive, when that is longer) plus some slack.
+fn jammed(seed: u32, digis: &[&str], disc: bool) {
+    let t = jammed_with(seed, digis, disc, LinkConfig::default());
+    let t = t.unwrap_or_else(|| panic!("A still in session after 900 s on a jammed channel via {digis:?}"));
+    let link = Link::new(Arc::new(Modem::new(OfdmParams::narrow(), 0.1)), LinkConfig::default(), 1);
+    let hops = digis.len() as u8;
+    let limit = link.busy_timeout_s(hops).max(link.keepalive_s(hops));
+    assert!(t < limit + 5.0, "via {digis:?}, disc {disc}: took {t:.0} s, limit {limit:.0} s");
 }
 
 #[test]
@@ -858,36 +864,94 @@ fn direct_retry_gives_up_on_a_jammed_channel() {
     // The peer goes silent and the channel then stays busy (a carrier, or a station we
     // are not talking to). A retry that gives way to a busy channel must still be
     // bounded: the session has to drop rather than wait for the channel forever.
-    let t = jammed(1, &[], false);
-    let limit = LinkConfig::default().busy_timeout_s;
-    assert!(t < limit + 5.0, "took {t:.0} s");
+    jammed(1, &[], false);
 }
 
 #[test]
 fn routed_retry_and_pending_disc_give_up_on_a_jammed_channel() {
     for (i, digis) in [&["LA3DDD"][..], &["LA3DDD", "LA4EEE-2"]].iter().enumerate() {
         for disc in [false, true] {
-            let t = jammed(50 + i as u32, digis, disc);
-            assert!(t < 300.0, "via {digis:?}, disc {disc}: took {t:.0} s");
+            jammed(50 + i as u32, digis, disc);
         }
     }
     jammed(52, &[], true);
 }
 
 #[test]
-fn busy_timeout_never_drops_a_working_session() {
-    // With no configured busy timeout, only the floor counts. Sessions whose ends hear
-    // each other and every digipeater keep the channel busy from a burst through its
-    // repeats and the answer's; they must still finish without dropping.
-    let cfg = LinkConfig { busy_timeout_s: 0.0, ..LinkConfig::default() };
-    for (i, digis) in [&[][..], &["LA3DDD"], &["LA3DDD", "LA4EEE-2"]].iter().enumerate() {
-        let seed = 60 + i as u32;
-        let mut net = Net::chain(seed, 0.05, digis, cfg.clone());
-        for (to, row) in net.hears.iter_mut().enumerate() {
-            for (from, h) in row.iter_mut().enumerate() {
-                *h = to != from;
-            }
+fn infinite_busy_timeout_never_drops() {
+    let cfg = LinkConfig { busy_timeout_s: f64::INFINITY, ..LinkConfig::default() };
+    assert_eq!(jammed_with(1, &[], false, cfg), None);
+}
+
+#[test]
+fn busy_timeout_setting_falls_back_to_the_floor() {
+    let modem = Arc::new(Modem::new(OfdmParams::narrow(), 0.1));
+    let with = |s: f64| Link::new(modem.clone(), LinkConfig { busy_timeout_s: s, ..LinkConfig::default() }, 1);
+    for hops in 0..=MAX_DIGIS as u8 {
+        let l = with(0.0);
+        let floor = l.max_burst_s + 2.0 * l.retry_wait(hops, false, 0.0);
+        for s in [0.0, -5.0, f64::NAN, f64::NEG_INFINITY, floor - 1.0] {
+            assert_eq!(with(s).busy_timeout_s(hops), floor, "setting {s}, hops {hops}");
         }
-        routed_session(net, digis, seed);
+        assert_eq!(with(floor + 100.0).busy_timeout_s(hops), floor + 100.0);
+        assert_eq!(with(f64::INFINITY).busy_timeout_s(hops), f64::INFINITY);
     }
+}
+
+#[test]
+fn busy_timeout_never_drops_a_working_session() {
+    // With no configured busy timeout, only the floor counts; a short keepalive keeps
+    // the keepalive term of the drop condition from covering for it. Two topologies: every
+    // station hears every other, so the channel stays busy from a burst through its
+    // repeats and the answer's; and neighbours only, where the ends do not hear each
+    // other and a digipeater's repeat of the peer's answer is the first we hear of it.
+    // Both must finish without dropping.
+    let cfg = LinkConfig { busy_timeout_s: 0.0, keepalive_s: 1.0, ..LinkConfig::default() };
+    for all_hear in [true, false] {
+        for (i, digis) in [&[][..], &["LA3DDD"], &["LA3DDD", "LA4EEE-2"]].iter().enumerate() {
+            let seed = 60 + i as u32;
+            let mut net = Net::chain(seed, 0.05, digis, cfg.clone());
+            if all_hear {
+                for (to, row) in net.hears.iter_mut().enumerate() {
+                    for (from, h) in row.iter_mut().enumerate() {
+                        *h = to != from;
+                    }
+                }
+            }
+            routed_session(net, digis, seed);
+        }
+    }
+}
+
+#[test]
+fn busy_timer_restarts_on_a_quiet_gap_or_our_burst_and_spares_a_burst_on_air() {
+    let mut net = Net::new(70, 0.0, 0.0);
+    net.nodes[A].link.connect(0.0, "LA1AAA", "LA2BBB-1", &[]).unwrap();
+    net.run_until(60.0, |n| n.both_connected());
+    net.nodes[A].link.send_data(&data(100, 70));
+    net.run_until(10.0, |n| n.nodes[A].tx.is_some());
+    let link = &mut net.nodes[A].link;
+    let t = net.now + 1000.0; // the peer is long silent
+    let limit = link.busy_timeout_s(0) + 1.0;
+    // Our burst is on the air: a long busy stretch does not drop the session.
+    assert!(link.poll(t, true).is_none());
+    assert!(link.poll(t + limit, true).is_none());
+    assert!(link.is_connected());
+    // Our burst ends: the busy stretch starts again from zero.
+    link.tx_done(t + limit);
+    assert_eq!(link.busy_since, None);
+    link.poll(t + limit, true);
+    link.poll(t + limit + 1.0, true);
+    assert!(link.is_connected());
+    // Unbroken, it drops.
+    link.poll(t + 2.0 * limit + 1.0, true);
+    assert!(!link.is_connected());
+    assert!(link.take_events().contains(&LinkEvent::Disconnected));
+    // A quiet moment restarts it.
+    let t = t + 3.0 * limit;
+    link.poll(t + 1.0, false);
+    assert_eq!(link.busy_since, None);
+    link.poll(t + 2.0, true);
+    link.poll(t + 3.0, true);
+    assert_eq!(link.busy_since, Some(t + 2.0));
 }
