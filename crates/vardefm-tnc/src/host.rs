@@ -14,7 +14,9 @@ pub enum Command {
     Disconnect,
     Abort,
     Version,
-    /// Accepted for compatibility, no effect (PUBLIC, COMPRESSION, CHAT, CWID, BWxxx, ... SESSION).
+    /// `CHAT ON/OFF`: whether to send `SN` reports (VARA sends them only with CHAT ON).
+    Chat(bool),
+    /// Accepted for compatibility, no effect (PUBLIC, COMPRESSION, CWID, BWxxx, ... SESSION).
     Ignored,
 }
 
@@ -49,7 +51,8 @@ pub fn parse(line: &str) -> Result<Command, ()> {
         "DISCONNECT" if args.is_empty() => Ok(Command::Disconnect),
         "ABORT" if args.is_empty() => Ok(Command::Abort),
         "VERSION" if args.is_empty() => Ok(Command::Version),
-        "PUBLIC" | "CHAT" | "CWID" if args.len() == 1 => on_off(arg(0)).map(|_| Command::Ignored),
+        "CHAT" if args.len() == 1 => on_off(arg(0)).map(Command::Chat),
+        "PUBLIC" | "CWID" if args.len() == 1 => on_off(arg(0)).map(|_| Command::Ignored),
         "COMPRESSION" if matches!(arg(0).as_deref(), Some("OFF" | "TEXT" | "FILES")) && args.len() == 1 => {
             Ok(Command::Ignored)
         }
@@ -91,7 +94,10 @@ mod tests {
         assert_eq!(parse("DISCONNECT"), Ok(Command::Disconnect));
         assert_eq!(parse("ABORT"), Ok(Command::Abort));
         assert_eq!(parse("VERSION"), Ok(Command::Version));
-        for ok in ["PUBLIC ON", "COMPRESSION TEXT", "CHAT OFF", "CWID ON", "BW2300", "P2P SESSION", "WINLINK SESSION"] {
+        assert_eq!(parse("CHAT ON"), Ok(Command::Chat(true)));
+        assert_eq!(parse("chat off"), Ok(Command::Chat(false)));
+        assert_eq!(parse("CHAT"), Err(()));
+        for ok in ["PUBLIC ON", "COMPRESSION TEXT", "CWID ON", "BW2300", "P2P SESSION", "WINLINK SESSION"] {
             assert_eq!(parse(ok), Ok(Command::Ignored), "{ok}");
         }
         for bad in

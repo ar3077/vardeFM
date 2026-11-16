@@ -106,6 +106,13 @@ impl Host {
         self.data.write_all(bytes).unwrap();
     }
 
+    /// Record every line that has arrived so far without waiting for one.
+    fn drain(&mut self) {
+        while let Ok(l) = self.lines.try_recv() {
+            self.seen.push(l);
+        }
+    }
+
     fn wait_rx(&self, n: usize) -> Vec<u8> {
         let deadline = Instant::now() + TIMEOUT;
         loop {
@@ -325,4 +332,84 @@ fn wrong_commands_and_abort() {
     a.expect("DISCONNECTED");
     b.expect("DISCONNECTED");
     sp.stop();
+}
+
+/// `SN` reports with `CHAT ON`, through sim-pair at several carrier-to-noise
+/// ratios: one per burst from the peer, VARA's format, and tracking the CNR.
+#[test]
+fn sn_reports_track_the_cnr() {
+    let mut highest = Vec::new();
+    for (k, cnr) in [6.0f32, 12.0, 18.0, 24.0].into_iter().enumerate() {
+        let sp = sim("narrow", Some(cnr), 0.0, 40 + k as u64);
+        let mut a = Host::connect("A", sp.addrs[0]);
+        let mut b = Host::connect("B", sp.addrs[1]);
+        b.command("MYCALL LA2BBB");
+        b.command("LISTEN ON");
+        a.command("MYCALL LA1AAA");
+        for h in [&mut a, &mut b] {
+            h.command("CHAT ON");
+        }
+        a.command("CONNECT LA1AAA LA2BBB");
+        a.expect("CONNECTED");
+        b.expect("CONNECTED");
+        // Traffic both ways for up to 60 s of simulated time. Below the FM
+        // threshold (6 dB) the transfer need not finish; only the readings matter.
+        let (to_a, to_b) = (payload(3000, 7), payload(3000, 8));
+        b.write(&to_a);
+        a.write(&to_b);
+        let t0 = sp.stats().now;
+        while sp.stats().now < t0 + 60.0
+            && (a.rx.lock().unwrap().len() < to_a.len() || b.rx.lock().unwrap().len() < to_b.len())
+        {
+            thread::sleep(Duration::from_millis(20));
+        }
+        thread::sleep(Duration::from_millis(300));
+        let mut all = Vec::new();
+        let mut per_side = Vec::new();
+        for h in [&mut a, &mut b] {
+            h.drain();
+            let sn: Vec<f32> = h
+                .seen
+                .iter()
+                .filter_map(|l| l.strip_prefix("SN "))
+                .map(|v| {
+                    let (_, dec) = v.split_once('.').expect("one decimal");
+                    assert_eq!(dec.len(), 1, "SN {v}: not one decimal");
+                    v.parse().unwrap()
+                })
+                .collect();
+            let first_sn = h.seen.iter().position(|l| l.starts_with("SN "));
+            let connected = h.seen.iter().position(|l| l.starts_with("CONNECTED"));
+            assert!(first_sn > connected, "{}: SN before CONNECTED: {:?}", h.name, h.seen);
+            assert!(!sn.is_empty(), "{}: no SN lines", h.name);
+            per_side.push(sn.len());
+            all.extend(sn);
+        }
+        all.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        let (med, max) = (all[all.len() / 2], all[all.len() - 1]);
+        println!(
+            "CNR {cnr:4.1} dB: SN highest {max:5.1} dB, median {med:5.1}, lowest {:.1}, lines A {} B {}",
+            all[0], per_side[0], per_side[1]
+        );
+        // The highest reading: control bursts (level 0) read lower than data bursts
+        // on a strong signal (PROTOCOL.md §4.2), and the mix varies from run to run.
+        highest.push((cnr, max));
+        // At 6 dB the link may already have been lost (DISCONNECTED seen); a second
+        // DISCONNECTED never comes (PROTOCOL.md §4.3).
+        let down = |h: &Host| {
+            h.seen.iter().rposition(|l| l == "DISCONNECTED") > h.seen.iter().rposition(|l| l.starts_with("CONNECTED"))
+        };
+        a.command("ABORT");
+        if !down(&a) {
+            a.expect("DISCONNECTED");
+        }
+        sp.stop();
+    }
+    for w in highest.windows(2) {
+        assert!(w[1].1 > w[0].1 + 2.0, "SN does not rise with the CNR: {highest:?}");
+    }
+    // Above the FM threshold the reading is within a few dB of the CNR.
+    for &(cnr, max) in &highest[1..] {
+        assert!((max - cnr).abs() <= 4.0, "CNR {cnr}: SN {max}");
+    }
 }

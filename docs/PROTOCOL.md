@@ -321,7 +321,8 @@ Each command gets `OK`, or `WRONG` if it is invalid.
 | `DISCONNECT` | Graceful: closes once everything queued is acknowledged. |
 | `ABORT` | Immediate close. |
 | `VERSION` | `OK`, then `VERSION VardeFM <version>`. |
-| `PUBLIC ON/OFF`, `COMPRESSION OFF/TEXT/FILES`, `CHAT ON/OFF`, `CWID ON/OFF`, `BW500/BW2300/BW2750`, `WINLINK SESSION`, `P2P SESSION` | Accepted (`OK`), no effect. |
+| `CHAT ON` / `CHAT OFF` | Send `SN` reports (§4.2) or not. Off by default, and off again when the command-port client disconnects. VARA's other `CHAT ON` effects (an implied `LISTEN ON`, keyboard-to-keyboard handover timing) are not copied. |
+| `PUBLIC ON/OFF`, `COMPRESSION OFF/TEXT/FILES`, `CWID ON/OFF`, `BW500/BW2300/BW2750`, `WINLINK SESSION`, `P2P SESSION` | Accepted (`OK`), no effect. |
 
 ### 4.2 Modem → host
 | Line | When |
@@ -333,7 +334,31 @@ Each command gets `OK`, or `WRONG` if it is invalid.
 | `BUFFER <n>` | Bytes queued and not yet acknowledged. Sent after every read from the data port (even if *n* is unchanged), and whenever acknowledgements change *n*, down to `BUFFER 0`. A report that follows a write therefore already counts that write. |
 | `PTT ON` / `PTT OFF` | Transmitter keyed / released. |
 | `BUSY ON` / `BUSY OFF` | Channel activity heard (audio in the carrier band at least 6 dB above the background level and above −40 dBFS, or a frame being received). The band is 422–2672 Hz in narrow mode and 400–6000 Hz in wide mode (filter edges, 6–9 dB down); sound outside it, such as a CTCSS tone, mains hum or hiss above the band, does not count. A steady open-squelch hiss becomes the background within about 2 s. After the modem's own transmission nothing is measured until the received audio comes back (at most 1 s), nor for 20 ms after that, and a busy hold from before the transmission ends. |
+| `SN <dB>` | With `CHAT ON` only: after every burst received from the session peer, its S/N with one decimal, e.g. `SN 12.3` or `SN -1.5`. That covers the connect request or answer that opens the session and every burst of the session after it. Bursts with another session id (other stations' sessions on the frequency) and bursts heard while not in a session are not reported. Sent after `CONNECTED`, never before it. See the note below the table. |
 | `IAMALIVE` | Every 60 s. |
+
+**What `SN` measures.** It is the receiver's own estimate, from the pilots, of the SNR per
+symbol (Es/N0) of the demodulated audio, in dB: the figure the modem logs for each burst
+and uses for rate adaptation (§3.2). It is not the RF carrier-to-noise ratio. Measured in
+`sim-pair` (narrow mode, test `sn_reports_track_the_cnr`, ranges over several runs):
+
+| CNR | Highest `SN` | Median `SN` |
+|---|---|---|
+| 6 dB | 5.9–8.0 | 5.6–5.9 |
+| 12 dB | 14.6–14.7 | 14.2 |
+| 18 dB | 19.2–19.3 | 18.5–18.9 |
+| 24 dB | 23.4–23.5 | 21.3–22.1 |
+
+Above the FM threshold the reading is within about 2.5 dB of the CNR (9 dB CNR still read
+11.5). At 6 dB, below the threshold, the discriminator's clicks dominate and the reading
+stays around the CNR. The highest reading is limited by the burst's own drive level: about
+21 dB on level-0 bursts (connect, ack and poll bursts) and about 25 dB on level-6 data
+bursts, so a strong signal reads a few dB lower on a short control burst than on a data
+burst; that is why the median falls behind the highest reading at 24 dB. The estimate is
+capped at 60 dB. Hosts that show a meter may want to smooth it.
+
+The VARA document lists `SN value` as "S/N of the received frame", sent only with
+`CHAT ON`. Pat ignores the line.
 
 ### 4.3 Data port
 While connected, bytes written are sent and received bytes are delivered. Any byte value
@@ -363,8 +388,7 @@ travel on different sockets.
 - `VERSION` gets `OK` before the `VERSION …` line. Whether real VARA sends `OK` here is
   unverified, so hosts should accept either.
 - If the command-port client disconnects, any session is aborted.
-- Not implemented: `CQFRAME`, `SN` reports, `REGISTERED`/`LINK REGISTERED`, encryption,
-  compression.
+- Not implemented: `CQFRAME`, `REGISTERED`/`LINK REGISTERED`, encryption, compression.
 
 ### 4.5 KISS port
 A separate TCP port (`modem --kiss-port`, default 8100, `off` to disable; the same default

@@ -24,6 +24,14 @@ stations ignore the new burst kind.
   covers only about the first 1.7 s of such a burst, so in a longer burst an older
   station may start to transmit (PROTOCOL.md §2.3). `sim-pair` has `--a-kiss-port`/`--b-kiss-port` (defaults 8100/8110).
   Details in docs/PROTOCOL.md §2.3, §3.4 and §4.5.
+- **`SN` reports, as VARA sends them.** After `CHAT ON`, the modem sends `SN <dB>` (one
+  decimal, e.g. `SN 12.3`) on the command port after every burst it receives from its
+  session peer. Bursts of other sessions on the frequency are not reported. The value is
+  the receiver's pilot-based S/N of the demodulated audio, the same figure as in the
+  modem's log. In `sim-pair` it reads within about 2.5 dB of the CNR above the FM
+  threshold. `CHAT ON/OFF` used to be accepted and ignored. It now switches `SN` on and
+  off; it is off by default and again when the host disconnects. Hosts that never send
+  `CHAT ON`, such as Pat, see no change. Details in docs/PROTOCOL.md §4.1, §4.2.
 - **Performance gates.** `level_gate` and `fer_gate` are ignored tests, run by hand in
   release mode, that fail when decoding performance moves. Per mode and level, the CNR
   at which 10 % of codewords fail, and per mode and drive level the CNR at which 10 % of

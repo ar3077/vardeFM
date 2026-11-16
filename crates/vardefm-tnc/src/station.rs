@@ -39,6 +39,8 @@ pub struct Station {
     busy_reported: bool,
     last_alive: f64,
     bandwidth: &'static str,
+    /// `CHAT ON`: report the S/N of every burst from the session peer (`SN <dB>`).
+    chat: bool,
 }
 
 impl Station {
@@ -54,6 +56,7 @@ impl Station {
             busy_reported: false,
             last_alive: 0.0,
             bandwidth,
+            chat: false,
         }
     }
 
@@ -92,6 +95,10 @@ impl Station {
                 self.line("OK");
                 self.link.abort(now);
             }
+            Command::Chat(on) => {
+                self.chat = on;
+                self.line("OK");
+            }
             Command::Version => {
                 self.line("OK");
                 self.line(format!("VERSION {}", crate::VERSION));
@@ -111,8 +118,10 @@ impl Station {
         self.link.send_unproto(now, frame);
     }
 
-    /// The host closed the command port: drop any session.
+    /// The host closed the command port: drop any session, and forget its settings
+    /// that only matter to it (`CHAT`), so the next host starts from the defaults.
     pub fn host_closed(&mut self, now: f64) {
+        self.chat = false;
         self.link.abort(now);
     }
 
@@ -173,6 +182,8 @@ impl Station {
     pub fn take_output(&mut self) -> Vec<HostOut> {
         for e in self.link.take_events() {
             let o = match e {
+                LinkEvent::PeerSnr(db) if self.chat => HostOut::Line(sn_line(db)),
+                LinkEvent::PeerSnr(_) => continue,
                 LinkEvent::Pending => HostOut::Line("PENDING".into()),
                 LinkEvent::CancelPending => HostOut::Line("CANCELPENDING".into()),
                 LinkEvent::Connected { source, destination } => {
@@ -186,5 +197,26 @@ impl Station {
             self.out.push(o);
         }
         std::mem::take(&mut self.out)
+    }
+}
+
+/// `SN <dB>` with one decimal, as VARA sends it (e.g. `SN 12.3`, `SN -2.0`).
+pub fn sn_line(snr_db: f32) -> String {
+    let v = (snr_db * 10.0).round() / 10.0;
+    let v = if v == 0.0 || !v.is_finite() { 0.0 } else { v }; // no "-0.0"
+    format!("SN {v:.1}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sn_line;
+
+    #[test]
+    fn sn_format() {
+        assert_eq!(sn_line(12.34), "SN 12.3");
+        assert_eq!(sn_line(12.35), "SN 12.4");
+        assert_eq!(sn_line(-2.0), "SN -2.0");
+        assert_eq!(sn_line(-0.04), "SN 0.0");
+        assert_eq!(sn_line(60.0), "SN 60.0");
     }
 }

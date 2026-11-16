@@ -162,7 +162,7 @@ impl Default for LinkConfig {
 }
 
 /// Notifications for the host application.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum LinkEvent {
     Pending,
     CancelPending,
@@ -177,6 +177,10 @@ pub enum LinkEvent {
     Data(Vec<u8>),
     /// One frame from a received Unproto burst (from any station, in any state).
     Unproto(Vec<u8>),
+    /// A burst of our own session arrived from the peer (or the connect request
+    /// that opened it): its SNR in dB, as the receiver measured it. Bursts of
+    /// other sessions on the frequency are not reported.
+    PeerSnr(f32),
 }
 
 /// What the last transmitted burst contained (for logging).
@@ -508,6 +512,7 @@ impl Link {
                 }
                 let (id, local, remote) = (*session, mycall.clone(), target.clone());
                 self.events.push(LinkEvent::Connected { source: local.clone(), destination: remote.clone() });
+                self.events.push(LinkEvent::PeerSnr(rx.snr_db));
                 let mut s = self.new_session(id, local, remote, true, now, req, h.req_level);
                 // Let the called station speak first.
                 s.phase = Phase::Wait { deadline: now + self.cfg.response_timeout_s, retry: false };
@@ -520,6 +525,7 @@ impl Link {
                 if h.session != s.id {
                     return;
                 }
+                self.events.push(LinkEvent::PeerSnr(rx.snr_db));
                 match h.kind {
                     Kind::ConnectReq if !s.caller => {
                         // Our ConnectAck was lost; send it again.
@@ -541,6 +547,7 @@ impl Link {
         let Some(local) = self.mycalls.iter().find(|c| norm_call(c) == dst).cloned() else { return };
         self.events.push(LinkEvent::Pending);
         self.events.push(LinkEvent::Connected { source: src.clone(), destination: local.clone() });
+        self.events.push(LinkEvent::PeerSnr(rx.snr_db));
         // The caller has not heard us yet, so its requested level is just a default.
         // Our own measurement of its request is a better guess (same radio path).
         let mut s = self.new_session(rx.header.session, local, src, false, now, req, req);
