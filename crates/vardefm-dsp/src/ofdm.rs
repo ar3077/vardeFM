@@ -73,8 +73,9 @@ pub struct Detection {
     pub at: Option<usize>,
     /// Where a caller searches on from: after a found frame whose header fails, or
     /// once more audio has arrived. Schmidl-Cox resumes at its detection, which can
-    /// lie past the end of the plateau it scanned. `from <= resume <= rx.len()` (`resume == from` when
-    /// `from` is at or past the end), and `resume > from` when a frame was found.
+    /// lie past the end of the plateau it scanned. `from <= resume <= max(from,
+    /// rx.len())`, with `resume == from` when `from` is at or past the end, and
+    /// `resume > from` when a frame was found.
     pub resume: usize,
 }
 

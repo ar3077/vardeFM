@@ -43,6 +43,8 @@ pub(crate) type DetectFn = fn(&Modem, &[f32], usize) -> Option<usize>;
 /// `burst` is judged by the modem's own `Receiver`, which uses `Ofdm::detect`, so
 /// every entry here must be that detector.
 pub(crate) const DETECTORS: &[(&str, DetectFn)] = &[("sc", |m, rx, from| m.ofdm.detect(rx, from).at)];
+// A second entry would get the first one's `burst` result.
+const _: () = assert!(DETECTORS.len() == 1, "burst is judged with the modem's own detector only");
 
 /// Leader length used by the evaluation, seconds (the `vardefm modem` default).
 const TXDELAY: f32 = 0.15;
