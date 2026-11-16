@@ -24,6 +24,13 @@ stations ignore the new burst kind.
   covers only about the first 1.7 s of such a burst, so in a longer burst an older
   station may start to transmit (PROTOCOL.md §2.3). `sim-pair` has `--a-kiss-port`/`--b-kiss-port` (defaults 8100/8110).
   Details in docs/PROTOCOL.md §2.3, §3.4 and §4.5.
+- **S/N of received broadcasts (`UNPROTO SN`, VardeFM only).** After `UNPROTO SN ON`,
+  each received Unproto burst gives one command-port line, `UNPROTO SN <dB> <crc> …`: the
+  burst's S/N and the CRC-32 of each frame it delivered to the KISS port. A host matches
+  KISS frames to the line by CRC, so the S/N reaches the right frames whatever order the
+  two sockets deliver them in. The KISS port is unchanged: other KISS clients such as
+  VarAC still get exactly the same bytes. Real VARA answers `WRONG` to `UNPROTO SN ON`.
+  Details and the reasoning in docs/PROTOCOL.md §4.5.
 - **`SN` reports, as VARA sends them.** After `CHAT ON`, the modem sends `SN <dB>` (one
   decimal, e.g. `SN 12.3`) on the command port after every burst it receives from its
   session peer. Bursts of other sessions on the frequency are not reported. The value is

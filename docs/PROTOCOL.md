@@ -322,6 +322,7 @@ Each command gets `OK`, or `WRONG` if it is invalid.
 | `ABORT` | Immediate close. |
 | `VERSION` | `OK`, then `VERSION VardeFM <version>`. |
 | `CHAT ON` / `CHAT OFF` | Send `SN` reports (§4.2) or not. Off by default, and off again when the command-port client disconnects. VARA's other `CHAT ON` effects (an implied `LISTEN ON`, keyboard-to-keyboard handover timing) are not copied. |
+| `UNPROTO SN ON` / `UNPROTO SN OFF` | VardeFM only: send `UNPROTO SN` reports (§4.2, §4.5) or not. Off by default, and off again when the command-port client disconnects. Real VARA answers `WRONG`, which tells a host the reports are not available. |
 | `PUBLIC ON/OFF`, `COMPRESSION OFF/TEXT/FILES`, `CWID ON/OFF`, `BW500/BW2300/BW2750`, `WINLINK SESSION`, `P2P SESSION` | Accepted (`OK`), no effect. |
 
 ### 4.2 Modem → host
@@ -335,6 +336,7 @@ Each command gets `OK`, or `WRONG` if it is invalid.
 | `PTT ON` / `PTT OFF` | Transmitter keyed / released. |
 | `BUSY ON` / `BUSY OFF` | Channel activity heard (audio in the carrier band at least 6 dB above the background level and above −40 dBFS, or a frame being received). The band is 422–2672 Hz in narrow mode and 400–6000 Hz in wide mode (filter edges, 6–9 dB down); sound outside it, such as a CTCSS tone, mains hum or hiss above the band, does not count. A steady open-squelch hiss becomes the background within about 2 s. After the modem's own transmission nothing is measured until the received audio comes back (at most 1 s), nor for 20 ms after that, and a busy hold from before the transmission ends. |
 | `SN <dB>` | With `CHAT ON` only: after every burst received from the session peer, its S/N with one decimal, e.g. `SN 12.3` or `SN -1.5`. That covers the connect request or answer that opens the session and every burst of the session after it. Bursts with another session id (other stations' sessions on the frequency) and bursts heard while not in a session are not reported. Sent after `CONNECTED`, never before it. See the note below the table. |
+| `UNPROTO SN <dB> <crc> …` | VardeFM only, with `UNPROTO SN ON`: after every received Unproto burst (§3.4) that delivered at least one frame to the KISS port, the burst's S/N (formatted as for `SN`) and then, for each of those frames in order, the CRC-32 of the frame as 8 upper-case hex digits. Sent in any state, including during a session. How a host uses it: §4.5. |
 | `IAMALIVE` | Every 60 s. |
 
 **What `SN` measures.** It is the receiver's own estimate, from the pilots, of the SNR per
@@ -412,3 +414,49 @@ sent as `DB DC`, and FESC as `DB DD`.
 
 `sim-pair` gives each station a KISS port: `--a-kiss-port` (default 8100) and
 `--b-kiss-port` (default 8110), each a port number or `off`.
+
+#### S/N of received broadcasts (`UNPROTO SN`)
+A host that wants to know how well it hears the station behind a CQ, broadcast or beacon
+sends `UNPROTO SN ON` on the command port. After each received Unproto burst the modem
+then sends one line on the command port:
+
+    UNPROTO SN 17.4 6C447797 F86971FE 3FBDD9F7
+
+That is the burst's S/N (the same measurement and format as `SN`, §4.2), then one CRC-32
+per frame the burst delivered to the KISS port, in the order they were delivered. The CRC
+is the standard CRC-32 (IEEE 802.3, reflected polynomial `0xEDB88320`, as computed by
+zlib, zip and Node's `zlib.crc32`; `CRC32("123456789") = CBF43926`). It is taken over the
+frame exactly as KISS clients get it after unescaping, type byte first, without the FENDs.
+Frames lost to a failed codeword (§3.4) are not delivered, so they are not named either.
+A burst that delivers no frame gives no line. A station never hears its own broadcasts,
+so it never reports them.
+
+**Attributing the S/N to frames.** For each frame from the KISS port, compute its CRC-32
+and take the oldest not-yet-used entry with that CRC from the `UNPROTO SN` lines received
+in the last few seconds. If none has arrived yet, keep the frame for a moment (say 2 s) and
+match it when the line comes. Match the other way round as well: a line may arrive before
+its frames.
+
+**Why it is built this way.**
+- *Nothing is added to the KISS port.* Other KISS clients (VarAC, APRS programs) must keep
+  getting the frames byte for byte, and every KISS client gets everything the port sends.
+  So the S/N cannot ride inside the frames, nor in extra KISS frames such as a vendor
+  command. It goes on the command port, which has one client and which that client asked
+  for.
+- *The two sockets are not ordered.* The modem writes a burst's frames to the KISS port
+  first and the `UNPROTO SN` line to the command port right after, in the same step. But
+  a host reads the two sockets separately, so it may see the line first, or after the next
+  burst's frames. "The next *n* frames" or "the frames since the last line" would then be
+  wrong. Naming each frame by the CRC of its own bytes does not depend on arrival order at
+  all.
+- *Identical CRCs are harmless.* Two frames with the same CRC are, apart from a 2⁻³² chance,
+  the same bytes, including the AX.25 source address, so they came from the same station.
+  That happens when a station repeats a CQ or a `[PAGE]` line. Matching the oldest entry
+  first then gives each copy the S/N of one of the bursts that carried it. Either answer is
+  a correct reading of that station.
+- *One line per burst, not per frame.* All frames of a burst share one measurement.
+- *A burst counter was not chosen.* It would have to be carried in the KISS stream to be
+  of any use, which rules it out (see the first point).
+
+The longest line comes from a level-1 burst full of one-byte frames: 243 CRCs in narrow
+mode, 632 in wide mode, about 5.7 KB. Hosts that cap line length should allow for that.

@@ -181,6 +181,12 @@ pub enum LinkEvent {
     /// that opened it): its SNR in dB, as the receiver measured it. Bursts of
     /// other sessions on the frequency are not reported.
     PeerSnr(f32),
+    /// Follows the `Unproto` events of one received burst: the burst's SNR in dB
+    /// and how many of the events just before it (its frames) it carried.
+    UnprotoSnr {
+        snr_db: f32,
+        frames: usize,
+    },
 }
 
 /// What the last transmitted burst contained (for logging).
@@ -473,9 +479,14 @@ impl Link {
         self.stats.codewords_failed += rx.payload.iter().filter(|p| p.is_none()).count() as u64;
         if h.kind == Kind::Unproto {
             // For every station, whatever its state; it never touches a session.
-            for f in parse_unproto(&rx.payload) {
+            let frames = parse_unproto(&rx.payload);
+            let n = frames.len();
+            for f in frames {
                 self.stats.unproto_received += 1;
                 self.events.push(LinkEvent::Unproto(f));
+            }
+            if n > 0 {
+                self.events.push(LinkEvent::UnprotoSnr { snr_db: rx.snr_db, frames: n });
             }
             return;
         }

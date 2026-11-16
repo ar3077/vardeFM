@@ -41,6 +41,9 @@ pub struct Station {
     bandwidth: &'static str,
     /// `CHAT ON`: report the S/N of every burst from the session peer (`SN <dB>`).
     chat: bool,
+    /// `UNPROTO SN ON`: report the S/N of every received Unproto burst, with the
+    /// CRC-32 of each frame it carried (`UNPROTO SN <dB> <crc> …`).
+    unproto_sn: bool,
 }
 
 impl Station {
@@ -57,6 +60,7 @@ impl Station {
             last_alive: 0.0,
             bandwidth,
             chat: false,
+            unproto_sn: false,
         }
     }
 
@@ -99,6 +103,10 @@ impl Station {
                 self.chat = on;
                 self.line("OK");
             }
+            Command::UnprotoSn(on) => {
+                self.unproto_sn = on;
+                self.line("OK");
+            }
             Command::Version => {
                 self.line("OK");
                 self.line(format!("VERSION {}", crate::VERSION));
@@ -119,9 +127,11 @@ impl Station {
     }
 
     /// The host closed the command port: drop any session, and forget its settings
-    /// that only matter to it (`CHAT`), so the next host starts from the defaults.
+    /// that only matter to it (`CHAT`, `UNPROTO SN`), so the next host starts from
+    /// the defaults.
     pub fn host_closed(&mut self, now: f64) {
         self.chat = false;
+        self.unproto_sn = false;
         self.link.abort(now);
     }
 
@@ -180,10 +190,21 @@ impl Station {
 
     /// Everything for the host since the last call, in order.
     pub fn take_output(&mut self) -> Vec<HostOut> {
+        // CRC-32 of each Unproto frame handed to the KISS port in this batch, for the
+        // `UNPROTO SN` line that follows a burst's frames.
+        let mut crcs: Vec<u32> = Vec::new();
         for e in self.link.take_events() {
             let o = match e {
                 LinkEvent::PeerSnr(db) if self.chat => HostOut::Line(sn_line(db)),
                 LinkEvent::PeerSnr(_) => continue,
+                LinkEvent::UnprotoSnr { snr_db, frames } if self.unproto_sn => {
+                    HostOut::Line(unproto_sn_line(snr_db, &crcs[crcs.len().saturating_sub(frames)..]))
+                }
+                LinkEvent::UnprotoSnr { .. } => continue,
+                LinkEvent::Unproto(f) => {
+                    crcs.push(frame_crc(&f));
+                    HostOut::Kiss(f)
+                }
                 LinkEvent::Pending => HostOut::Line("PENDING".into()),
                 LinkEvent::CancelPending => HostOut::Line("CANCELPENDING".into()),
                 LinkEvent::Connected { source, destination } => {
@@ -192,7 +213,6 @@ impl Station {
                 LinkEvent::Disconnected => HostOut::Line("DISCONNECTED".into()),
                 LinkEvent::Buffer(n) => HostOut::Line(format!("BUFFER {n}")),
                 LinkEvent::Data(d) => HostOut::Data(d),
-                LinkEvent::Unproto(f) => HostOut::Kiss(f),
             };
             self.out.push(o);
         }
@@ -207,9 +227,25 @@ pub fn sn_line(snr_db: f32) -> String {
     format!("SN {v:.1}")
 }
 
+/// CRC-32 (IEEE 802.3, the one zlib, zip and Node's `zlib.crc32` compute) of a
+/// KISS frame exactly as KISS clients get it: unescaped, type byte first.
+pub fn frame_crc(frame: &[u8]) -> u32 {
+    vardefm_fec::crc::crc32(frame)
+}
+
+/// `UNPROTO SN <dB> <crc> …`: the S/N of an Unproto burst (as in [`sn_line`]) and
+/// the [`frame_crc`] of each frame it carried, in order, as 8 upper-case hex digits.
+pub fn unproto_sn_line(snr_db: f32, crcs: &[u32]) -> String {
+    let mut s = format!("UNPROTO {}", sn_line(snr_db));
+    for c in crcs {
+        s.push_str(&format!(" {c:08X}"));
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
-    use super::sn_line;
+    use super::{frame_crc, sn_line, unproto_sn_line};
 
     #[test]
     fn sn_format() {
@@ -218,5 +254,20 @@ mod tests {
         assert_eq!(sn_line(-2.0), "SN -2.0");
         assert_eq!(sn_line(-0.04), "SN 0.0");
         assert_eq!(sn_line(60.0), "SN 60.0");
+    }
+
+    #[test]
+    fn unproto_sn_format() {
+        assert_eq!(frame_crc(b"123456789"), 0xCBF4_3926);
+        // Ortoo's CQ frame (type byte 0x01 first), see tests/unproto.rs.
+        let cq = [
+            0x01, 0x86, 0xa2, 0x40, 0x40, 0x40, 0x40, 0x40, 0x60, 0x9c, 0x66, 0x98, 0x9e, 0x40, 0x40, 0x40, 0x69, 0x03,
+            0xf0,
+        ];
+        assert_eq!(
+            unproto_sn_line(9.04, &[frame_crc(&cq), 0x0000_00ab]),
+            format!("UNPROTO SN 9.0 {:08X} 000000AB", frame_crc(&cq))
+        );
+        assert_eq!(unproto_sn_line(-3.0, &[]), "UNPROTO SN -3.0");
     }
 }

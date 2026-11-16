@@ -16,6 +16,9 @@ pub enum Command {
     Version,
     /// `CHAT ON/OFF`: whether to send `SN` reports (VARA sends them only with CHAT ON).
     Chat(bool),
+    /// `UNPROTO SN ON/OFF` (VardeFM only): whether to send `UNPROTO SN` reports
+    /// for received Unproto bursts.
+    UnprotoSn(bool),
     /// Accepted for compatibility, no effect (PUBLIC, COMPRESSION, CWID, BWxxx, ... SESSION).
     Ignored,
 }
@@ -52,6 +55,7 @@ pub fn parse(line: &str) -> Result<Command, ()> {
         "ABORT" if args.is_empty() => Ok(Command::Abort),
         "VERSION" if args.is_empty() => Ok(Command::Version),
         "CHAT" if args.len() == 1 => on_off(arg(0)).map(Command::Chat),
+        "UNPROTO" if args.len() == 2 && arg(0).as_deref() == Some("SN") => on_off(arg(1)).map(Command::UnprotoSn),
         "PUBLIC" | "CWID" if args.len() == 1 => on_off(arg(0)).map(|_| Command::Ignored),
         "COMPRESSION" if matches!(arg(0).as_deref(), Some("OFF" | "TEXT" | "FILES")) && args.len() == 1 => {
             Ok(Command::Ignored)
@@ -97,6 +101,11 @@ mod tests {
         assert_eq!(parse("CHAT ON"), Ok(Command::Chat(true)));
         assert_eq!(parse("chat off"), Ok(Command::Chat(false)));
         assert_eq!(parse("CHAT"), Err(()));
+        assert_eq!(parse("UNPROTO SN ON"), Ok(Command::UnprotoSn(true)));
+        assert_eq!(parse("unproto sn off"), Ok(Command::UnprotoSn(false)));
+        for bad in ["UNPROTO", "UNPROTO SN", "UNPROTO ON", "UNPROTO SN MAYBE", "UNPROTO SN ON X"] {
+            assert_eq!(parse(bad), Err(()), "{bad}");
+        }
         for ok in ["PUBLIC ON", "COMPRESSION TEXT", "CWID ON", "BW2300", "P2P SESSION", "WINLINK SESSION"] {
             assert_eq!(parse(ok), Ok(Command::Ignored), "{ok}");
         }
