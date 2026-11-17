@@ -63,9 +63,6 @@ impl Ptt for FakePtt {
         c.ptt = on;
         Ok(())
     }
-    fn describe(&self) -> String {
-        "fake".into()
-    }
 }
 
 impl Card {
@@ -288,19 +285,19 @@ fn level_lines_only_when_asked() {
     }
 }
 
-/// A, a digipeater and B on fake sound cards, set up from a `RadioConfig` as `run`
-/// does. A and B hear only the digipeater.
+/// A, a digipeater and B on fake sound cards, set up from an `EngineConfig` as
+/// an embedding host would. A and B hear only the digipeater.
 #[test]
 fn session_through_a_digipeater_over_fake_sound_cards() {
     let cards: [Shared; 3] = [Arc::default(), Arc::default(), Arc::default()];
     let (a, d, b) = (0, 1, 2);
     let mut eng: Vec<RadioEngine<FakeOut>> = (0..3)
         .map(|i| {
-            let cfg = RadioConfig {
+            let cfg = EngineConfig {
                 // Not the default, so the check below shows it reaches the link.
                 hop_margin_s: 1.5,
                 digi_calls: if i == d { vec!["LA3DDD".into()] } else { Vec::new() },
-                ..RadioConfig::default()
+                ..EngineConfig::default()
             };
             let modem = Arc::new(Modem::new(OfdmParams::narrow(), cfg.txdelay_s));
             let (ptt, out) = (Box::new(FakePtt(cards[i].clone())), FakeOut(cards[i].clone()));
@@ -376,7 +373,7 @@ fn session_through_a_digipeater_over_fake_sound_cards() {
 }
 
 /// An engine built from `cfg` on a fake sound card.
-fn engine_from(cfg: &RadioConfig) -> std::io::Result<RadioEngine<FakeOut>> {
+fn engine_from(cfg: &EngineConfig) -> std::io::Result<RadioEngine<FakeOut>> {
     let card = Shared::default();
     let modem = Arc::new(Modem::new(OfdmParams::narrow(), 0.1));
     RadioEngine::from_config(cfg, modem, Box::new(FakePtt(card.clone())), FakeOut(card), 1)
@@ -384,31 +381,149 @@ fn engine_from(cfg: &RadioConfig) -> std::io::Result<RadioEngine<FakeOut>> {
 
 #[test]
 fn default_config_gives_the_links_defaults() {
-    let eng = engine_from(&RadioConfig::default()).unwrap();
+    let eng = engine_from(&EngineConfig::default()).unwrap();
     assert_eq!(eng.station.link_config(), &LinkConfig::default());
 }
 
 #[test]
 fn bad_config_is_refused() {
-    let ok = RadioConfig::default;
+    let ok = EngineConfig::default;
     let bad = [
-        (RadioConfig { hop_margin_s: -0.1, ..ok() }, "hop margin must be from 0 to 10 seconds"),
-        (RadioConfig { hop_margin_s: 10.5, ..ok() }, "hop margin must be from 0 to 10 seconds"),
-        (RadioConfig { hop_margin_s: f64::NAN, ..ok() }, "hop margin must be from 0 to 10 seconds"),
-        (RadioConfig { max_level: 7, ..ok() }, "max level must be from 0 to 6"),
-        (RadioConfig { txdelay_s: f32::NAN, ..ok() }, "txdelay must be 0 or more"),
-        (RadioConfig { txtail_s: -0.1, ..ok() }, "txtail must be 0 or more"),
-        (RadioConfig { tx_gain: f32::INFINITY, ..ok() }, "tx gain must be 0 or more"),
+        (EngineConfig { hop_margin_s: -0.1, ..ok() }, "hop margin must be from 0 to 10 seconds"),
+        (EngineConfig { hop_margin_s: 10.5, ..ok() }, "hop margin must be from 0 to 10 seconds"),
+        (EngineConfig { hop_margin_s: f64::NAN, ..ok() }, "hop margin must be from 0 to 10 seconds"),
+        (EngineConfig { max_level: 7, ..ok() }, "max level must be from 0 to 6"),
+        (EngineConfig { txdelay_s: f32::NAN, ..ok() }, "txdelay must be 0 or more"),
+        (EngineConfig { txtail_s: -0.1, ..ok() }, "txtail must be 0 or more"),
+        (EngineConfig { tx_gain: f32::INFINITY, ..ok() }, "tx gain must be 0 or more"),
         (
-            RadioConfig { digi_calls: vec!["LA3DDD".into(), " LA4EEE".into()], ..ok() },
+            EngineConfig { digi_calls: vec!["LA3DDD".into(), " LA4EEE".into()], ..ok() },
             "digipeater \" LA4EEE\": not a valid call sign",
         ),
-        (RadioConfig { digi_calls: vec!["".into()], ..ok() }, "digipeater \"\": not a valid call sign"),
+        (EngineConfig { digi_calls: vec!["".into()], ..ok() }, "digipeater \"\": not a valid call sign"),
     ];
     for (cfg, why) in bad {
         assert_eq!(cfg.check().unwrap_err().to_string(), why);
         assert_eq!(engine_from(&cfg).err().map(|e| e.to_string()).as_deref(), Some(why));
     }
-    let edge = RadioConfig { hop_margin_s: 10.0, max_level: 6, digi_calls: vec!["la3ddd-7".into()], ..ok() };
+    let edge = EngineConfig { hop_margin_s: 10.0, max_level: 6, digi_calls: vec!["la3ddd-7".into()], ..ok() };
     assert!(engine_from(&edge).is_ok());
+}
+
+/// While keyed, station A advances its clock with [`RadioEngine::advance`] only
+/// (no RX audio). It must still release PTT after the tail.
+#[test]
+fn keyed_station_unkeys_with_advance_only() {
+    let cards: [Shared; 2] = [Arc::default(), Arc::default()];
+    let mut eng = [engine(&cards[0], 1), engine(&cards[1], 2)];
+    let mut host = [HostSide::default(), HostSide::default()];
+    let line = |s: &str| HostIn::Line(s.into());
+    let mut inbox: [Vec<HostIn>; 2] =
+        [vec![line("MYCALL LA1AAA"), line("CONNECT LA1AAA LA2BBB")], vec![line("MYCALL LA2BBB"), line("LISTEN ON")]];
+    let mut air = [vec![0.0f32; CHUNK], vec![0.0f32; CHUNK]];
+    let mut saw_keyed = false;
+
+    for step in 0..20_000 {
+        for i in 0..2 {
+            let out = if i == 0 && eng[0].transmitting() {
+                // No RX while keyed: only the sample clock advances.
+                eng[i].advance(CHUNK as u64, std::mem::take(&mut inbox[i]))
+            } else {
+                let other = &air[1 - i];
+                eng[i].step(Some(other), std::mem::take(&mut inbox[i]))
+            };
+            host[i].take(out);
+        }
+        for i in 0..2 {
+            air[i] = cards[i].lock().unwrap().tick();
+        }
+        if eng[0].transmitting() {
+            saw_keyed = true;
+        }
+        if saw_keyed && !eng[0].transmitting() && !cards[0].lock().unwrap().ptt {
+            for &t in &cards[0].lock().unwrap().tails {
+                assert!((5..=7).contains(&t), "PTT released {t} ticks after the last sample");
+            }
+            assert!(!eng[0].log.iter().any(|l| l.contains("watchdog")), "{:?}", eng[0].log);
+            assert!(eng[0].reports.iter().any(|r| matches!(r, Report::Tx { .. })));
+            return;
+        }
+        if host[0].has("DISCONNECTED") && host[1].has("DISCONNECTED") {
+            break;
+        }
+        let _ = step;
+    }
+    panic!("A never unkeyed under advance-only clocking");
+}
+
+#[test]
+fn watchdog_fires_under_advance_alone() {
+    let card: Shared = Arc::default();
+    card.lock().unwrap().stuck = true;
+    let mut eng = engine(&card, 3);
+    eng.step(None, vec![HostIn::Line("MYCALL LA1AAA".into()), HostIn::Line("CONNECT LA1AAA LA9ZZZ".into())]);
+    let mut keyed_at = None;
+    for step in 0..2000 {
+        eng.advance(CHUNK as u64, Vec::new());
+        // Sink stays stuck: nothing is consumed.
+        let ptt = card.lock().unwrap().ptt;
+        if ptt && keyed_at.is_none() {
+            keyed_at = Some(step);
+        }
+        if let (Some(k), false) = (keyed_at, ptt) {
+            let held = (step - k) as f64 * 0.01;
+            assert!(held < 6.0, "held PTT for {held} s");
+            assert!(eng.log.iter().any(|l| l.contains("watchdog")));
+            return;
+        }
+    }
+    panic!("never unkeyed");
+}
+
+/// `set(false)` may block; audio that arrives meanwhile is processed after it returns.
+#[test]
+fn blocking_ptt_off_is_harmless() {
+    struct SlowOff {
+        card: Shared,
+        delayed: Arc<Mutex<Option<Vec<f32>>>>,
+    }
+    impl Ptt for SlowOff {
+        fn set(&mut self, on: bool) -> io::Result<()> {
+            if !on {
+                // Simulate a radio that confirms un-key slowly: audio that the
+                // caller would have fed during the wait is held and applied after.
+                let mut delayed = self.delayed.lock().unwrap();
+                *delayed = Some(vec![0.0; CHUNK]);
+            }
+            FakePtt(self.card.clone()).set(on)
+        }
+    }
+
+    let card: Shared = Arc::default();
+    let delayed: Arc<Mutex<Option<Vec<f32>>>> = Arc::default();
+    let modem = Arc::new(Modem::new(OfdmParams::narrow(), 0.15));
+    let mut eng = RadioEngine::new(
+        modem,
+        LinkConfig::default(),
+        Box::new(SlowOff { card: card.clone(), delayed: delayed.clone() }),
+        FakeOut(card.clone()),
+        0.05,
+        7,
+    );
+    eng.step(None, vec![HostIn::Line("MYCALL LA1AAA".into()), HostIn::Line("CONNECT LA1AAA LA9ZZZ".into())]);
+    let silence = vec![0.0f32; CHUNK];
+    for _ in 0..2000 {
+        eng.step(Some(&silence), Vec::new());
+        card.lock().unwrap().tick();
+        if let Some(chunk) = delayed.lock().unwrap().take() {
+            // Audio that "arrived" while set(false) blocked is fed after it returns.
+            eng.step(Some(&chunk), Vec::new());
+        }
+        if eng.log.iter().any(|l| l.contains("watchdog") || !eng.transmitting()) && !card.lock().unwrap().ptt {
+            // Engine stayed consistent: no audio leaked with PTT off.
+            assert_eq!(card.lock().unwrap().leaked, 0);
+            return;
+        }
+    }
+    panic!("never finished a transmission");
 }

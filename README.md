@@ -64,13 +64,18 @@ crates/vardefm-dsp     OFDM modulator/demodulator, constellations, filters
 crates/vardefm-fec     LDPC codes, CRCs, scrambling, interleaving
 crates/vardefm-modem   bursts: header, speed levels, coded payload, streaming receiver
 crates/vardefm-link    ARQ link layer (connect, reliable byte stream, disconnect)
+crates/vardefm-engine  station + radio engine without desktop I/O (AudioSink / PTT traits)
+crates/vardefm-ffi     C ABI static library for embedding (see docs/EMBEDDING.md)
 crates/vardefm-sim     FM radio channel simulator
 crates/vardefm-tnc     VARA-compatible TCP interface, station logic, sim-pair, radio engine
 crates/vardefm-audio   sound card input/output (cpal)
 crates/vardefm-ptt     PTT: CM108/CM119/AIOC GPIO (after Dire Wolf), serial RTS/DTR, Hamlib rigctld, Linux GPIO
 crates/vardefm-cli     `vardefm` command-line tool
-packaging/             user guide and udev rules shipped in the release archives
+packaging/             user guide, udev rules, and Apple XCFramework packaging
 ```
+
+To embed the modem in another app (C ABI, no sound-card or TCP dependency), see
+[docs/EMBEDDING.md](docs/EMBEDDING.md).
 
 ### Virtual radio pair (`sim-pair`)
 
