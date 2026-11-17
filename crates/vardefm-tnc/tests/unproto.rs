@@ -515,7 +515,7 @@ fn broadcast_from_a_third_station_reaches_both_ends_of_a_session() {
         air.st[2].kiss_in(now, f);
     }
     air.run_until(120.0, |a| a.kiss(0).len() >= frames.len() && a.kiss(1).len() >= frames.len());
-    assert!(air.st[0].link.is_connected() && air.st[1].link.is_connected(), "the session dropped");
+    assert!(air.st[0].link().is_connected() && air.st[1].link().is_connected(), "the session dropped");
     assert_eq!(air.kiss(0), frames, "A's KISS port");
     assert_eq!(air.kiss(1), frames, "B's KISS port");
     assert!(air.kiss(2).is_empty());

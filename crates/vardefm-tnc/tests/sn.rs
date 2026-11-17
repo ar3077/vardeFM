@@ -173,7 +173,7 @@ fn sn_only_for_our_own_session_and_only_with_chat_on() {
     // Let the reply traffic and session 1's idle period play out a little.
     let until = air.now() + 3.0;
     air.run_until(10.0, |a| a.now() >= until);
-    assert!(air.st[A].link.is_connected() && air.st[C].link.is_connected(), "a session dropped");
+    assert!(air.st[A].link().is_connected() && air.st[C].link().is_connected(), "a session dropped");
 
     let (s1, s2) = (air.session(A), air.session(C));
     assert_eq!(air.session(B), s1);

@@ -6,9 +6,12 @@ run the same minor version.
 
 ## [Unreleased]
 
-This build is versioned `0.3.1-ortoo.2`: upstream master plus unconnected broadcasts and
-S/N reports for Ortoo. It is on-air compatible with 0.3.0 and 0.3.1. Sessions are unchanged, and older
-stations ignore the new burst kind.
+## [0.3.2-ortoo.1] - 2026-11-16
+
+This build is upstream 0.3.2 (digipeating included) plus unconnected broadcasts and S/N
+reports for Ortoo. It is on-air compatible with 0.3.0, 0.3.1, 0.3.2 and 0.3.1-ortoo.x for
+direct sessions, and with 0.3.2 for routed (digipeated) sessions. Older stations and stock
+0.3.2 ignore the Unproto burst kind. Unproto bursts are never digipeated.
 
 ### Added
 - **Unconnected broadcasts (Unproto) and a KISS port.** A new burst kind, 5 (`Unproto`),
@@ -23,7 +26,7 @@ stations ignore the new burst kind.
   kind 5 the way they ignore a corrupted header and report nothing. Their busy detection
   covers only about the first 1.7 s of such a burst, so in a longer burst an older
   station may start to transmit (PROTOCOL.md §2.3). `sim-pair` has `--a-kiss-port`/`--b-kiss-port` (defaults 8100/8110).
-  Details in docs/PROTOCOL.md §2.3, §3.4 and §4.5.
+  Details in docs/PROTOCOL.md §2.3, §3.5 and §4.5.
 - **S/N of received broadcasts (`UNPROTO SN`, VardeFM only).** After `UNPROTO SN ON`,
   each received Unproto burst gives one command-port line, `UNPROTO SN <dB> <crc> …`: the
   burst's S/N and the CRC-32 of each frame it delivered to the KISS port. A host matches
@@ -39,6 +42,35 @@ stations ignore the new burst kind.
   threshold. `CHAT ON/OFF` used to be accepted and ignored. It now switches `SN` on and
   off; it is off by default and again when the host disconnects. Hosts that never send
   `CHAT ON`, such as Pat, see no change. Details in docs/PROTOCOL.md §4.1, §4.2.
+
+### Merged from 0.3.2
+- **Unproto and digipeaters.** Unproto bursts are never digipeated: a digipeater ignores
+  kind 5 whatever its flags say, so a broadcast reaches only the stations that hear the
+  sender. An Unproto burst is sent with flags 0 and a receiver ignores its flags. A
+  digipeater's own broadcasts wait while a repeat is due, and after a repeat they wait for
+  a clear channel again, so they do not step into the next station's answer. With
+  `CHAT ON` on a routed session, `SN` is the S/N of the last hop. `sim-pair --digi` gives
+  KISS ports to A and B only. Details in docs/PROTOCOL.md §2.3, §3.5 and §4.2.
+
+## [0.3.2] - 2026-11-16
+
+On-air compatible with 0.3.0 and 0.3.1 for direct sessions. Digipeating is new and
+experimental: how a routed session looks on air may change in the next release, so the
+end stations and the digipeaters of a routed session should all run 0.3.2.
+
+### Added
+- **Digipeating.** `CONNECT <mycall> <target> VIA <d1> [<d2>]` connects through up to
+  two VardeFM digipeaters, as in VARA FM. `vardefm modem --digi <call>` makes a
+  station repeat the sessions routed through that call, with or without a host
+  connected. Each digipeater repeats every burst; acknowledgements and retries stay end
+  to end, and a codeword a digipeater could not decode is passed on as void so the
+  sender resends it. The end stations wait longer before retrying, by the repeats' airtime
+  plus `--hop-margin` (default 0.5 s) per digipeater. `sim-pair --digi <call>` puts
+  digipeaters between A and B, which then hear only their neighbours. On air, every burst
+  of a routed session is marked in new header flag bits, and its connect bursts carry a
+  `VFM2` payload; direct sessions are unchanged and still work with older builds, and
+  digipeaters never repeat them. See docs/PROTOCOL.md §3.4. (#24, #31, reviewed by
+  @mustig)
 - **Performance gates.** `level_gate` and `fer_gate` are ignored tests, run by hand in
   release mode, that fail when decoding performance moves. Per mode and level, the CNR
   at which 10 % of codewords fail, and per mode and drive level the CNR at which 10 % of
@@ -46,7 +78,10 @@ stations ignore the new burst kind.
   `crates/vardefm-modem/perf/levels.toml`; per LDPC code, the Eb/N0 of 1 % FER in
   `crates/vardefm-fec/perf/ldpc.toml`. `level_sweep` and `fer_curve` with `WRITE=1`
   record them again. The figures in `docs/PROTOCOL.md` §2.2 and §2.4 now refer to these
-  files.
+  files. (#13, thanks @mustig)
+- **Detector harness.** `detector_eval` is an ignored test that measures how often a burst
+  detector leads to a decoded burst, against decoding from the known burst position. It
+  changes nothing in the modem. (#6, thanks @mustig)
 
 ### Changed
 - **Busy detection measures only the carrier band** (422–2672 Hz narrow, 400–6000 Hz wide).
@@ -60,6 +95,9 @@ stations ignore the new burst kind.
   the tone came back abruptly and the band filter read that as busy for 150 ms after
   every burst, which held back the modem's next transmission. A busy hold from before a
   transmission no longer carries over it. (#10)
+- On the radio, session ids and retry delays are seeded from the operating system's
+  randomness. The process id alone could repeat between stations started from the same
+  system image, which then drew the same session ids.
 
 ### Fixed
 - `cargo clippy -- -D warnings` passes again with Rust 1.100 (`needless_range_loop` in the
@@ -67,6 +105,11 @@ stations ignore the new burst kind.
 - A NaN, an Inf or a sample far beyond full scale from the sound card no longer loses a
   burst it falls in or shortly before, and cannot leave busy detection deaf; the last
   good sample takes its place. (#10)
+- A transfer could stop for good, with the session still connected, after lost bursts
+  and a change of speed level. When data that had arrived ahead of a gap was sent again
+  at a faster level, the receiver acknowledged the longer copy but kept the shorter one,
+  so the sender never sent the difference again. Only the receiving side changes: a
+  station with this fix receives correctly from any version. (#29, thanks @mustig)
 
 ## [0.3.1] - 2026-11-09
 
@@ -156,7 +199,8 @@ correction with seven speed levels, selective-repeat ARQ link layer, VARA-compat
 host interface, `sim-pair` virtual radio pair, sound card I/O with serial, CM108 and
 GPIO PTT, and release builds for Windows, Linux and Raspberry Pi.
 
-[Unreleased]: https://github.com/notepid/vardeFM/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/notepid/vardeFM/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/notepid/vardeFM/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/notepid/vardeFM/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/notepid/vardeFM/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/notepid/vardeFM/compare/v0.2.0...v0.2.1

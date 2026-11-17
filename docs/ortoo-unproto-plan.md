@@ -1,7 +1,7 @@
 # Plan: unconnected broadcast bursts (Unproto) and a KISS port
 
 Status: **implemented** on branch `unproto-kiss` (version 0.3.1-ortoo.1). docs/PROTOCOL.md
-§2.3, §3.4 and §4.5 are the reference. This file is kept as the design record. Where the
+§2.3, §3.5 (§3.4 before the merge with 0.3.2) and §4.5 are the reference. This file is kept as the design record. Where the
 implementation differs from the plan below:
 
 - Each frame on the air is the whole KISS frame, **type byte included**, and it is

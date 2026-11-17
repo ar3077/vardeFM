@@ -91,8 +91,10 @@ vardefm sim-pair --cnr 18 --ppm -40 --record wavs
 | `--a-port`, `--b-port` | command ports (data = +1); defaults 8300 and 8310 |
 | `--a-kiss-port`, `--b-kiss-port` | KISS ports for unconnected broadcasts; defaults 8100 and 8110, `off` to disable |
 | `--speed <x>` | run x times faster than real time (0 = as fast as possible) |
-| `--record <dir>` | save each transmission as `NNNN_<A\|B>_tx.wav` and `_rx.wav` |
+| `--record <dir>` | save each transmission as `NNNN_<A\|B>_tx.wav` and `_rx.wav`; with `--digi` as `NNNN_<from>_tx.wav` and `NNNN_<from>_rx_<to>.wav`, the digipeaters being `D1` and `D2` |
 | `--seed <n>` | noise seed |
+| `--digi <call>` | put a digipeater between A and B (repeat for up to 2); A and B then hear only their neighbours |
+| `--hop-margin <s>` | extra wait per digipeater on A and B (default 0.5, at most 10) |
 
 It prints one line per transmission and per reception:
 ```
