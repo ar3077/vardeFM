@@ -72,6 +72,9 @@ const SEGMENT_HEADER: usize = 4;
 const RETRY_BACKOFF_S: f64 = 0.4;
 /// Largest random addition to the wait between connect requests.
 const CONNECT_JITTER_S: f64 = 0.5;
+/// While the channel is busy, a burst that is due is put off by this much, again and
+/// again until the channel is clear.
+const BUSY_RECHECK_S: f64 = 0.3;
 /// Largest `hop_margin_s`. A digipeater does not know the end stations' margin, so the
 /// lifetimes of its sessions are sized for this one.
 pub const MAX_HOP_MARGIN_S: f64 = 10.0;
@@ -366,18 +369,27 @@ impl Link {
     }
 
     /// Longest time a caller keeps retrying its ConnectReq through `hops` digipeaters:
-    /// `connect_attempts` periods of a connect burst, the wait after it, the jitter, and
-    /// one of our longest bursts, which keeps the channel busy and holds the retry back.
+    /// `connect_attempts` periods of a connect burst, the wait after it and the jitter,
+    /// plus the time one of our longest bursts can hold the retry back: the burst, the
+    /// busy detector's hang time after it (taken as at most one recheck) and the recheck.
     /// Assumes the caller uses our `connect_attempts` and `response_timeout_s`. If the
     /// window ends too soon, the caller's next ConnectReq is still answered.
     fn connect_window_s(&self, hops: u8) -> f64 {
-        let connect_s = self.modem.burst_seconds(0, 1) as f64;
-        let period = connect_s
-            + self.cfg.response_timeout_s
-            + self.relay_s(hops, connect_s, connect_s)
-            + CONNECT_JITTER_S
-            + self.max_burst_s;
+        let held_back = self.max_burst_s + 2.0 * BUSY_RECHECK_S;
+        let period = self.connect_s() + self.connect_wait_s(hops) + CONNECT_JITTER_S + held_back;
         self.cfg.connect_attempts as f64 * period
+    }
+
+    /// Airtime of a ConnectReq or ConnectAck.
+    fn connect_s(&self) -> f64 {
+        self.modem.burst_seconds(0, 1) as f64
+    }
+
+    /// Wait after a ConnectReq through `hops` digipeaters before retrying it, not counting
+    /// the jitter.
+    fn connect_wait_s(&self, hops: u8) -> f64 {
+        let connect_s = self.connect_s();
+        self.cfg.response_timeout_s + self.relay_s(hops, connect_s, connect_s)
     }
 
     /// Wait after our burst of `own_s` before retrying.
@@ -749,7 +761,7 @@ impl Link {
                     return None;
                 }
                 if busy {
-                    *next_tx = next_tx.max(now + 0.3);
+                    *next_tx = next_tx.max(now + BUSY_RECHECK_S);
                     return None;
                 }
                 if now < *next_tx {
@@ -784,7 +796,7 @@ impl Link {
                     Phase::Sending { .. } => return None,
                     Phase::Wait { deadline, retry } => {
                         if busy {
-                            s.phase = Phase::Wait { deadline: deadline.max(now + 0.3), retry };
+                            s.phase = Phase::Wait { deadline: deadline.max(now + BUSY_RECHECK_S), retry };
                             return None;
                         }
                         if now < deadline {
@@ -871,12 +883,12 @@ impl Link {
     /// Called when the burst returned by `poll` has finished transmitting.
     pub(crate) fn tx_done(&mut self, now: f64) {
         let timeout = self.cfg.response_timeout_s;
-        let connect_s = self.modem.burst_seconds(0, 1) as f64;
+        let connect_s = self.connect_s();
         // Draw the retry jitter only while connecting, as before digipeating, so direct
         // sessions keep their random sequence.
         let jitter = if matches!(self.state, State::Connecting { .. }) { self.rand_s(CONNECT_JITTER_S) } else { 0.0 };
         let (wait, echo) = match &self.state {
-            State::Connecting { digis, .. } => (timeout + self.relay_s(digis.len() as u8, connect_s, connect_s), 0.0),
+            State::Connecting { digis, .. } => (self.connect_wait_s(digis.len() as u8), 0.0),
             State::Connected(s) => {
                 // Time for every digipeater to repeat our ConnectAck.
                 let hops = s.route.hops() as f64;
