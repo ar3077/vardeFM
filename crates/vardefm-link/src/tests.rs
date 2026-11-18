@@ -1162,8 +1162,8 @@ fn jammed_with(seed: u32, digis: &[&str], disc: bool, gaps: bool, cfg: LinkConfi
     (net.has(A, &LinkEvent::Disconnected).then_some(net.now - t0), limit)
 }
 
-/// As `jammed_with` on the default config, and checks A dropped no later than the busy
-/// timeout for its route plus some slack.
+/// As `jammed_with` on the default config, and checks A dropped after the busy timeout
+/// for its route, but no later than that plus some slack.
 fn jammed(seed: u32, digis: &[&str], disc: bool) {
     jammed_cfg(seed, digis, disc, LinkConfig::default());
 }
@@ -1171,7 +1171,7 @@ fn jammed(seed: u32, digis: &[&str], disc: bool) {
 fn jammed_cfg(seed: u32, digis: &[&str], disc: bool, cfg: LinkConfig) {
     let (t, limit) = jammed_with(seed, digis, disc, false, cfg);
     let t = t.unwrap_or_else(|| panic!("A still in session after 900 s on a jammed channel via {digis:?}"));
-    assert!(t < limit + 5.0, "via {digis:?}, disc {disc}: took {t:.0} s, limit {limit:.0} s");
+    assert!(t > limit && t < limit + 5.0, "via {digis:?}, disc {disc}: took {t:.0} s, limit {limit:.0} s");
 }
 
 #[test]
@@ -1301,7 +1301,7 @@ fn short_quiet_gaps_do_not_keep_a_jammed_session_open() {
     for (i, digis) in [&[][..], &["LA3DDD"], &["LA3DDD", "LA4EEE-2"]].iter().enumerate() {
         let (t, limit) = jammed_with(80 + i as u32, digis, false, true, LinkConfig::default());
         let t = t.unwrap_or_else(|| panic!("via {digis:?}: still in session after 900 s"));
-        assert!(t < limit + 5.0, "via {digis:?}: took {t:.0} s, limit {limit:.0} s");
+        assert!(t > limit && t < limit + 5.0, "via {digis:?}: took {t:.0} s, limit {limit:.0} s");
     }
 }
 
@@ -1328,7 +1328,7 @@ fn connect_gives_up_on_a_jammed_channel() {
         net.nodes[A].node.link.connect(0.0, "LA1AAA", "LA2BBB-1", &via(digis)).unwrap();
         let limit = net.nodes[A].node.link.busy_timeout_s(digis.len() as u8);
         let t = net.run_until(900.0, |n| n.has(A, &LinkEvent::Disconnected));
-        assert!(t < limit + 5.0, "via {digis:?}: took {t:.0} s, limit {limit:.0} s");
+        assert!(t > limit && t < limit + 5.0, "via {digis:?}: took {t:.0} s, limit {limit:.0} s");
         assert!(net.sent.iter().all(|&(from, ..)| from != A), "via {digis:?}: A keyed up on a busy channel");
     }
 }
