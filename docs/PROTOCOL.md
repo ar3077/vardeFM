@@ -227,8 +227,14 @@ and checked by the `fer_gate` test. That file is the reference; roughly, the poi
   A called station that has heard no burst of the session from the caller since its
   `ConnectAck` resends the `ConnectAck` instead of Data when a burst goes unanswered, for
   as long as the caller could still be retrying its `ConnectReq` (`connect_attempts` ×
-  (connect burst + wait + 0.5 s jitter)). It also answers a repeated `ConnectReq` with
-  its `ConnectAck`.
+  (connect burst + wait + relay time through the digipeaters + 0.5 s jitter + longest
+  burst)). It also answers a repeated `ConnectReq` with its `ConnectAck`, but only one
+  that names its caller, itself and its path: another is a different caller's that
+  happens to use the same session id.
+- **Mixed versions:** a 0.3.x station as the caller connects on the called
+  station's first Data burst too. As the called station it does not resend its
+  `ConnectAck` unprompted, so a caller of this version that missed it recovers only if
+  a later `ConnectReq` gets through, and gives up more often on a lossy channel.
 - **Turns:** the called station may send first right after `ConnectAck`; the caller
   waits one response period for it.
 - Bursts with a different session id are ignored.

@@ -366,11 +366,17 @@ impl Link {
     }
 
     /// Longest time a caller keeps retrying its ConnectReq through `hops` digipeaters:
-    /// `connect_attempts` periods of a connect burst, the wait after it and the jitter.
+    /// `connect_attempts` periods of a connect burst, the wait after it, the jitter, and
+    /// one of our longest bursts, which keeps the channel busy and holds the retry back.
+    /// Assumes the caller uses our `connect_attempts` and `response_timeout_s`. If the
+    /// window ends too soon, the caller's next ConnectReq is still answered.
     fn connect_window_s(&self, hops: u8) -> f64 {
         let connect_s = self.modem.burst_seconds(0, 1) as f64;
-        let period =
-            connect_s + self.cfg.response_timeout_s + self.relay_s(hops, connect_s, connect_s) + CONNECT_JITTER_S;
+        let period = connect_s
+            + self.cfg.response_timeout_s
+            + self.relay_s(hops, connect_s, connect_s)
+            + CONNECT_JITTER_S
+            + self.max_burst_s;
         self.cfg.connect_attempts as f64 * period
     }
 
@@ -554,7 +560,15 @@ impl Link {
                 }
                 match h.kind {
                     Kind::ConnectReq if !s.route.caller => {
-                        // Our ConnectAck was lost; send it again.
+                        // Our ConnectAck was lost; send it again. Only to our caller: a
+                        // request naming other stations or another path is another
+                        // caller's that happens to use our session id.
+                        let ours = parse_calls(rx).is_some_and(|(src, dst, digis)| {
+                            src == s.remote && dst == norm_call(&s.local) && digis == s.route.digis
+                        });
+                        if !ours {
+                            return;
+                        }
                         s.last_heard = now;
                         s.phase = Phase::Respond { at: now + turnaround, kind: Kind::ConnectAck, initiated: false };
                     }
