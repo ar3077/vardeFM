@@ -242,6 +242,12 @@ struct Session {
     closing: Option<f64>,
     disc_tries: u32,
     last_heard: f64,
+    /// Called station: until then, unless the caller has sent a burst of the session,
+    /// the caller may have missed our ConnectAck and still be retrying its ConnectReq.
+    /// Our retries then send the ConnectAck again instead of Data. After it, a caller
+    /// that missed the ConnectAck has given up. `NEG_INFINITY` once answered, and for
+    /// the caller.
+    ack_until: f64,
 }
 
 enum State {
@@ -357,6 +363,15 @@ impl Link {
     /// (`own_s`) and then the answer (at most `reply_s`), after its turnaround.
     fn relay_s(&self, hops: u8, own_s: f64, reply_s: f64) -> f64 {
         hops as f64 * (own_s + reply_s + 2.0 * self.cfg.turnaround_s + self.cfg.hop_margin_s)
+    }
+
+    /// Longest time a caller keeps retrying its ConnectReq through `hops` digipeaters:
+    /// `connect_attempts` periods of a connect burst, the wait after it and the jitter.
+    fn connect_window_s(&self, hops: u8) -> f64 {
+        let connect_s = self.modem.burst_seconds(0, 1) as f64;
+        let period =
+            connect_s + self.cfg.response_timeout_s + self.relay_s(hops, connect_s, connect_s) + CONNECT_JITTER_S;
+        self.cfg.connect_attempts as f64 * period
     }
 
     /// Wait after our burst of `own_s` before retrying.
@@ -517,13 +532,11 @@ impl Link {
                 if h.session != *session || !route.accepts(&h) {
                     return;
                 }
-                let accepted = match h.kind {
-                    Kind::ConnectAck => {
-                        parse_calls(rx).is_some_and(|(s, d, v)| s == *mycall && d == *target && v == *digis)
-                    }
-                    Kind::Data => true,
-                    _ => false,
-                };
+                // Only a ConnectAck naming our request answers it. Other bursts carry no
+                // call signs: one with our id may be another session's that uses the same
+                // id. If the called station's ConnectAck is lost, it sends it again.
+                let accepted = h.kind == Kind::ConnectAck
+                    && parse_calls(rx).is_some_and(|(s, d, v)| s == *mycall && d == *target && v == *digis);
                 if !accepted {
                     return;
                 }
@@ -534,9 +547,6 @@ impl Link {
                 let mut s = self.new_session(id, local, remote, route, now, req, h.req_level);
                 s.phase = Phase::Wait { deadline: now + wait, retry: false };
                 self.state = State::Connected(Box::new(s));
-                if h.kind == Kind::Data {
-                    self.on_session_burst(now, rx, req);
-                }
             }
             State::Connected(s) => {
                 if h.session != s.id || !s.route.accepts(&h) {
@@ -568,7 +578,9 @@ impl Link {
         self.events.push(LinkEvent::Connected { source: src.clone(), destination: local.clone() });
         // The caller has not heard us yet, so its requested level is just a default.
         // Our own measurement of its request is a better guess (same radio path).
+        let window = self.connect_window_s(route.hops());
         let mut s = self.new_session(rx.header.session, local, src, route, now, req, req);
+        s.ack_until = now + window;
         s.phase = Phase::Respond { at: now + self.cfg.turnaround_s, kind: Kind::ConnectAck, initiated: false };
         self.state = State::Connected(Box::new(s));
     }
@@ -607,6 +619,7 @@ impl Link {
             closing: None,
             disc_tries: 0,
             last_heard: now,
+            ack_until: f64::NEG_INFINITY,
         }
     }
 
@@ -615,6 +628,7 @@ impl Link {
         let turnaround = self.cfg.turnaround_s;
         let State::Connected(s) = &mut self.state else { return };
         s.last_heard = now;
+        s.ack_until = f64::NEG_INFINITY;
         s.retries = 0;
         s.peer_level = h.req_level.min(self.cfg.max_level);
         s.req_level = req;
@@ -771,7 +785,15 @@ impl Link {
                             }
                             // Unanswered: the peer may not have decoded us. Step down.
                             s.peer_level = s.peer_level.saturating_sub(1);
-                            let kind = if s.closing.is_some() && s.disc_tries > 0 { Kind::Disc } else { Kind::Data };
+                            // A called station not yet answered sends its ConnectAck again: the
+                            // caller takes nothing else as the answer to its request.
+                            let kind = if s.closing.is_some() && s.disc_tries > 0 {
+                                Kind::Disc
+                            } else if now < s.ack_until {
+                                Kind::ConnectAck
+                            } else {
+                                Kind::Data
+                            };
                             // Through digipeaters, both ends may retry while a repeat is
                             // on the air; a wider spread keeps them from colliding again.
                             // On any route, a busy channel is most likely the peer's burst

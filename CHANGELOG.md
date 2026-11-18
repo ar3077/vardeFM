@@ -11,6 +11,15 @@ run the same minor version.
   can be embedded as a library in any application, including closed-source ones (#19). Releases up to and including
   0.3.2 remain available under GPL-3.0-or-later.
 
+### Fixed
+- **Connecting to a busy frequency.** A calling station took any Data burst with its
+  session id as the answer to its request. When another session on the frequency used
+  the same 1-byte id (1 call in 255), the caller reported CONNECTED, received that
+  session's data and stalled it (#27). The caller now connects only on a ConnectAck
+  naming its request. A called station that has not heard from the caller since its
+  ConnectAck resends the ConnectAck, not Data, when a burst goes unanswered, so a lost
+  ConnectAck no longer leaves the session half open. On-air compatible with 0.3.x.
+
 ## [0.3.2] - 2026-11-16
 
 On-air compatible with 0.3.0 and 0.3.1 for direct sessions. Digipeating is new and
