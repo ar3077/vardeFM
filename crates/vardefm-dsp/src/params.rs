@@ -39,10 +39,10 @@ pub struct OfdmParams {
     /// `detector_eval`'s CTCSS pass (level 1), detection then decodes every burst the
     /// genie does at 20 dB CNR, for every tone at up to 1500 Hz deviation (twice the
     /// usual). At the sensitivity knee (5 dB narrow, 7 dB wide) it keeps the share of
-    /// genie bursts it has without a tone. The exception is narrow de-emphasised audio
-    /// at 1500 Hz deviation, where the tone costs the genie bursts too (demodulation,
-    /// #18). In narrow mode the higher
-    /// corner also removes de-emphasised noise and detects weak bursts better.
+    /// genie bursts it has without a tone, on every path and at every deviation. On
+    /// narrow de-emphasised audio at 1500 Hz deviation the tone costs the genie many
+    /// bursts too (demodulation, #18). In narrow mode the higher corner also removes de-emphasised noise and
+    /// detects weak bursts better.
     ///
     /// The low-pass is for the flat data port, where FM noise rises with frequency, so
     /// the lower part of the band gives a much cleaner detection metric.

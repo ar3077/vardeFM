@@ -52,7 +52,9 @@
 //!
 //! Environment: `MODES` (narrow,wide), `TRIALS` per CNR (100), `LEVEL` (1), `NCW` (1),
 //! `CNRS` (dB list, default per mode), `NOISE_SECONDS` per noise case (60),
-//! `CTCSS_TRIALS` per tone and deviation (10; 0 skips the pass), `CTCSS_CNRS` (dB list: 5,20 narrow, 7,20 wide: the knee and well above it),
+//! `CTCSS_TRIALS` per tone and deviation (10; 0 skips the pass; trial `t` has the same
+//! noise in every row, so the rows are paired and each rests on that many noise draws),
+//! `CTCSS_CNRS` (dB list; 5,20 narrow and 7,20 wide: the knee and well above it),
 //! `CSV` (file to append the burst results to).
 
 use super::*;
