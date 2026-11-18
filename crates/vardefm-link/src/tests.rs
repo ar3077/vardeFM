@@ -1255,6 +1255,7 @@ fn caller_does_not_join_a_session_it_hears() {
     // C goes before B, which `Net` takes to be the last station.
     net.nodes.insert(1, peer);
     let (c, b) = (1, 2);
+    assert_eq!((net.nodes[A].name.as_str(), net.nodes[b].name.as_str(), net.b()), ("A", "B", b));
     net.hears = vec![vec![false, true, true], vec![true, false, true], vec![true, true, false]];
 
     net.run_until(60.0, |n| n.both_connected());

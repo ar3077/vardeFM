@@ -11,7 +11,7 @@ run the same minor version.
   the channel in the last 10 minutes. With a shared id, a caller could take the Data of
   a session it overheard as its own answer, report CONNECTED to a station that never
   answered, and disturb that session (#27). A session the caller cannot hear can still
-  clash: a connecting caller still accepts any Data with its id.
+  share its id. Separately, a connecting caller still accepts any Data with its id.
 
 ### Changed
 - **License.** VardeFM is now dual licensed under MIT OR Apache-2.0, at your option, so it

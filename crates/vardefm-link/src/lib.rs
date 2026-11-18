@@ -427,9 +427,10 @@ impl Link {
 
     /// How long a caller avoids a session id after hearing it, so it does not share an id
     /// with a session it can hear (issue #27): as long as a digipeater keeps an idle
-    /// session, and three keepalive intervals, so a quiet session's id is not freed.
+    /// session, and three of the longest keepalive intervals (a routed session's), so a
+    /// quiet session's id is not freed.
     fn heard_id_s(&self) -> f64 {
-        digi::IDLE_EXPIRY_S.max(3.0 * self.cfg.keepalive_s)
+        digi::IDLE_EXPIRY_S.max(3.0 * self.keepalive_s(MAX_DIGIS as u8))
     }
 
     /// A random non-zero session id not heard in the last [`Self::heard_id_s`]. If every
