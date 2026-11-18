@@ -108,7 +108,8 @@ pub struct LinkConfig {
     /// moment too short for the burst to go out does not count as progress, nor does a
     /// digipeater repeat. Without this a carrier or other stations' traffic could keep a
     /// dead session, or a connect attempt, open forever. A dropped session's Disc goes
-    /// out once the channel is quiet, in case the peer is there but we cannot decode it.
+    /// out once the channel is quiet, in case the peer is there but we cannot decode it,
+    /// unless the channel stays busy for this long again.
     ///
     /// The link raises a smaller value to a floor chosen to cover an exchange with the
     /// peer through the session's digipeaters (the longest burst plus two of the called
@@ -285,9 +286,12 @@ pub struct Link {
     rng: Prng,
     /// A burst to send once even though we are disconnected (Disc after ABORT, DiscAck re-sends).
     oneshot: Option<Burst>,
-    /// A Disc for a session a busy channel ended, sent once the channel is quiet so that
-    /// it is not lost under the carrier. Dropped if a new session starts first.
-    parting: Option<Burst>,
+    /// A Disc for a session a busy channel ended, and the time after which it is too late
+    /// to send. It goes out once the channel is quiet, so that it is not lost under the
+    /// carrier. Dropped if a new session starts first, or once it is too late: the peer
+    /// has given up by then, and a late Disc could end its next session if that one got
+    /// the same id.
+    parting: Option<(f64, Burst)>,
     /// Recently closed session, so a repeated Disc can still be answered.
     closed: Option<(u8, Route)>,
     /// Longest burst any level can send, seconds.
@@ -524,6 +528,7 @@ impl Link {
             self.closed = Some((s.id, s.route.clone()));
         }
         self.state = State::Idle;
+        self.held_since = None;
         self.events.push(LinkEvent::Disconnected);
     }
 
@@ -768,7 +773,11 @@ impl Link {
         if !self.is_idle() {
             self.parting = None;
         }
-        if let Some(b) = self.oneshot.take().or_else(|| if busy { None } else { self.parting.take() }) {
+        if self.parting.as_ref().is_some_and(|&(until, _)| now > until) {
+            self.parting = None;
+        }
+        let parting = || if busy { None } else { self.parting.take().map(|(_, b)| b) };
+        if let Some(b) = self.oneshot.take().or_else(parting) {
             self.last_tx = TxInfo { kind: b.header.kind, ..TxInfo::default() };
             self.stats.bursts_sent += 1;
             return Some(b);
@@ -791,7 +800,7 @@ impl Link {
         // forever. A peer we hear but cannot decode is no progress.
         if self.held_since.is_some_and(|t| now - t > busy_timeout) {
             // Tell the peer, in case it is there but we cannot decode it under the carrier.
-            self.parting = self.disc_burst();
+            self.parting = self.disc_burst().map(|b| (now + busy_timeout, b));
             self.close();
             return None;
         }

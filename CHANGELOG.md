@@ -60,10 +60,11 @@ run the same minor version.
   `LinkConfig::busy_timeout_s` (default 60 s) with none of our own bursts going out and
   nothing heard from the peer. A short quiet gap in the carrier, or a repeat sent as a
   digipeater, does not restart that time. A dropped session sends one Disc once the
-  channel is quiet, so a peer that was there but could not be heard learns of it. A
+  channel is quiet (if that comes within the same time again), so a peer that was there
+  but could not be heard learns of it. A
   shorter setting is raised to a floor chosen to cover an exchange with the peer
   through the session's digipeaters, so the peer's own bursts and their repeats do not
-  end a working session. (#32)
+  end a working session. (#32, #49)
 
 ## [0.3.1] - 2026-11-09
 

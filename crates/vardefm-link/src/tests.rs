@@ -1361,3 +1361,72 @@ fn dropped_session_sends_a_disc_once_the_channel_is_quiet() {
     assert_eq!(discs.len(), 1, "A's Discs at {discs:?}");
     assert!(discs[0] >= end, "Disc at {:.2} into the carrier (ends {end:.2})", discs[0]);
 }
+
+#[test]
+fn new_connect_attempt_does_not_inherit_the_held_back_timer() {
+    // A connect attempt held back for most of the busy timeout, then aborted. A new
+    // attempt started at once gets the whole timeout again.
+    let modem = Arc::new(Modem::new(OfdmParams::narrow(), 0.1));
+    let mut link = Link::new(modem, LinkConfig::default(), 1);
+    let bt = link.busy_timeout_s(0);
+    link.connect(0.0, "LA1AAA", "LA2BBB-1", &[]).unwrap();
+    assert!(link.poll(0.0, true).is_none());
+    assert!(link.poll(0.9 * bt, true).is_none());
+    let t = 0.9 * bt;
+    link.abort(t);
+    link.connect(t, "LA1AAA", "LA2BBB-1", &[]).unwrap();
+    assert!(link.poll(t + 0.01, true).is_none());
+    assert!(link.poll(t + 0.5 * bt, true).is_none());
+    assert!(!link.is_idle(), "new attempt ended after {:.1} s", 0.5 * bt);
+}
+
+#[test]
+fn a_disc_held_back_past_the_busy_timeout_is_not_sent() {
+    // As above, but the carrier outlasts the drop by more than the busy timeout. A Disc
+    // that late could end the peer's next session if it got the same id: drop it.
+    let cfg = LinkConfig { keepalive_s: 600.0, ..LinkConfig::default() };
+    let mut net = Net::chain(120, 0.0, &["LA3DDD"], cfg);
+    let jammer = 1;
+    for (to, row) in net.hears.iter_mut().enumerate() {
+        for (from, h) in row.iter_mut().enumerate() {
+            *h = to != from && !(from == jammer && to != A);
+        }
+    }
+    net.nodes[A].node.link.connect(0.0, "LA1AAA", "LA2BBB-1", &[]).unwrap();
+    net.run_until(60.0, |n| n.both_connected());
+    net.run_until(60.0, |n| n.now > 20.0 && n.nodes.iter().all(|x| x.tx.is_none()));
+    let start = net.now;
+    net.history.push((jammer, start, start + 1000.0));
+    net.nodes[A].node.link.send_data(&data(200, 120));
+    net.run_until(300.0, |n| n.has(A, &LinkEvent::Disconnected));
+    let end = net.now + net.nodes[A].node.link.busy_timeout_s(0) + 5.0;
+    net.history.retain(|&(g, ..)| g != jammer);
+    net.history.push((jammer, start, end));
+    net.run_until(400.0, |n| n.now > end + 10.0);
+    assert!(!net.sent.iter().any(|&(from, .., k)| from == A && k == Kind::Disc), "stale Disc sent");
+}
+
+#[test]
+fn an_accepted_peer_burst_restarts_the_held_back_timer() {
+    // A is closing, and its Disc is held back. Accepting B's ack is progress even though
+    // it leaves the Disc still waiting, so the timer starts again.
+    let mut net = Net::new(130, 0.0, 0.0);
+    net.nodes[A].node.link.connect(0.0, "LA1AAA", "LA2BBB-1", &[]).unwrap();
+    net.run_until(60.0, |n| n.both_connected());
+    net.run_until(60.0, |n| n.now > 20.0 && n.nodes.iter().all(|x| x.tx.is_none()));
+    net.nodes[A].node.link.send_data(&data(50, 130));
+    net.run_until(30.0, |n| n.nodes[1].tx.is_some());
+    let (.., burst, _) = net.nodes[1].tx.clone().unwrap();
+    assert_eq!(burst.header.ncw, 0, "expected B's ack");
+    let rx =
+        RxBurst { header: burst.header, payload: Vec::new(), snr_db: 30.0, end_sample: 0, level: Default::default() };
+    let link = &mut net.nodes[A].node.link;
+    let bt = link.busy_timeout_s(0);
+    let t = net.now;
+    link.disconnect(t);
+    assert!(link.poll(t, true).is_none());
+    assert!(link.poll(t + 0.9 * bt, true).is_none());
+    link.on_burst(t + 0.9 * bt, &rx);
+    assert!(link.poll(t + 1.1 * bt, true).is_none());
+    assert!(link.is_connected(), "dropped although B's ack came in {:.1} s ago", 0.2 * bt);
+}
