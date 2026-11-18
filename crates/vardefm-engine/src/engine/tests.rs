@@ -3,6 +3,7 @@
 
 use super::*;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 const CHUNK: usize = 480; // 10 ms
@@ -97,9 +98,30 @@ impl Card {
     }
 }
 
+/// A PTT whose `set(false)` takes `ticks` steps to return. A thread inside the call
+/// steps nothing, so until `blocked` is back at 0 the test must not step the engine.
+struct SlowOff {
+    ptt: FakePtt,
+    ticks: usize,
+    blocked: Arc<AtomicUsize>,
+}
+
+impl Ptt for SlowOff {
+    fn set(&mut self, on: bool) -> io::Result<()> {
+        if !on {
+            self.blocked.store(self.ticks, Ordering::Relaxed);
+        }
+        self.ptt.set(on)
+    }
+}
+
 fn engine(card: &Shared, seed: u32) -> RadioEngine<FakeOut> {
+    engine_with_ptt(card, Box::new(FakePtt(card.clone())), seed)
+}
+
+fn engine_with_ptt(card: &Shared, ptt: Box<dyn Ptt>, seed: u32) -> RadioEngine<FakeOut> {
     let modem = Arc::new(Modem::new(OfdmParams::narrow(), 0.15));
-    RadioEngine::new(modem, LinkConfig::default(), Box::new(FakePtt(card.clone())), FakeOut(card.clone()), 0.05, seed)
+    RadioEngine::new(modem, LinkConfig::default(), ptt, FakeOut(card.clone()), 0.05, seed)
 }
 
 #[derive(Default)]
@@ -124,7 +146,15 @@ impl HostSide {
 
 #[test]
 fn session_over_fake_sound_cards() {
-    session(0.0);
+    session(0.0, 0);
+}
+
+/// `set(false)` may block, here for 500 ms at every un-key. The other station's
+/// reply comes on the air meanwhile. Its audio is processed late, once `set(false)`
+/// has returned, and the session must run as if nothing had happened.
+#[test]
+fn blocking_ptt_off_is_harmless() {
+    session(0.0, 50);
 }
 
 /// With the squelch open each radio hears hiss (-27 dBFS rms, as measured on a
@@ -132,11 +162,12 @@ fn session_over_fake_sound_cards() {
 /// a busy channel, or no one would ever transmit.
 #[test]
 fn session_with_open_squelch() {
-    session(0.045);
+    session(0.045, 0);
 }
 
 /// A full session; `hiss` is the RMS of the noise heard while the other side is silent.
-fn session(hiss: f32) {
+/// Station A's `set(false)` takes `slow_off` steps to return.
+fn session(hiss: f32, slow_off: usize) {
     let mut seed = 0x1234_5678u32;
     let mut hiss_chunk = move || -> Vec<f32> {
         (0..CHUNK)
@@ -149,7 +180,10 @@ fn session(hiss: f32) {
             .collect()
     };
     let cards: [Shared; 2] = [Arc::default(), Arc::default()];
-    let mut eng = [engine(&cards[0], 1), engine(&cards[1], 2)];
+    // Steps left until A's `set(false)` returns.
+    let blocked = Arc::new(AtomicUsize::new(0));
+    let slow = SlowOff { ptt: FakePtt(cards[0].clone()), ticks: slow_off, blocked: blocked.clone() };
+    let mut eng = [engine_with_ptt(&cards[0], Box::new(slow), 1), engine(&cards[1], 2)];
     let mut host = [HostSide::default(), HostSide::default()];
     let line = |s: &str| HostIn::Line(s.into());
     let mut inbox: [Vec<HostIn>; 2] =
@@ -158,18 +192,38 @@ fn session(hiss: f32) {
     let to_b: Vec<u8> = (0..1500u32).map(|i| (i * 13 + 5) as u8).collect();
     let mut air = [vec![0.0f32; CHUNK], vec![0.0f32; CHUNK]];
     let (mut sent_b, mut sent_a, mut disc) = (false, false, false);
+    // What A's sound card recorded while A was inside `set(false)`.
+    let mut backlog: Vec<f32> = Vec::new();
+    // B's bursts that came on the air while A was inside `set(false)`.
+    let mut started_in_backlog = 0;
+    let mut b_on_air = false;
 
     for step in 0..60_000 {
         // Each station hears what the other radiated in the previous tick.
         for i in 0..2 {
             let other = &air[1 - i];
-            let heard = if hiss > 0.0 && other.iter().all(|x| *x == 0.0) { hiss_chunk() } else { other.clone() };
+            let mut heard = if hiss > 0.0 && other.iter().all(|x| *x == 0.0) { hiss_chunk() } else { other.clone() };
+            if i == 0 {
+                // The sound card records on while `set(false)` blocks. The engine gets
+                // all of it in one go afterwards.
+                backlog.append(&mut heard);
+                if blocked.load(Ordering::Relaxed) > 0 {
+                    blocked.fetch_sub(1, Ordering::Relaxed);
+                    continue;
+                }
+                heard = std::mem::take(&mut backlog);
+            }
             let out = eng[i].step(Some(&heard), std::mem::take(&mut inbox[i]));
             host[i].take(out);
         }
         for i in 0..2 {
             air[i] = cards[i].lock().unwrap().tick();
         }
+        let on_air = air[1].iter().any(|x| *x != 0.0);
+        if on_air && !b_on_air && blocked.load(Ordering::Relaxed) > 0 {
+            started_in_backlog += 1;
+        }
+        b_on_air = on_air;
         // Host behaviour: B sends a banner once connected, A answers, then A disconnects.
         if !sent_b && host[1].lines.iter().any(|l| l.starts_with("CONNECTED")) {
             inbox[1].push(HostIn::Data(to_a.clone()));
@@ -191,6 +245,8 @@ fn session(hiss: f32) {
     assert_eq!(host[0].data, to_a, "A's received data");
     assert_eq!(host[1].data, to_b, "B's received data");
     assert!(host[0].has("DISCONNECTED") && host[1].has("DISCONNECTED"), "A: {:?}", host[0].lines);
+    // The case a slow `set(false)` is about: A gets the start of a reply late.
+    assert!(slow_off == 0 || started_in_backlog > 0, "none of B's bursts began while A was blocked");
     for (i, c) in cards.iter().enumerate() {
         let c = c.lock().unwrap();
         assert_eq!(c.leaked, 0, "station {i}: audio played with PTT off");
@@ -203,6 +259,9 @@ fn session(hiss: f32) {
     }
     for i in 0..2 {
         assert!(!eng[i].log.iter().any(|l| l.contains("watchdog")), "{:?}", eng[i].log);
+        // Without noise nothing is lost on the way: no burst has to be sent again.
+        let retried = eng[i].reports.iter().any(|r| matches!(r, Report::Tx { info, .. } if info.retry > 0));
+        assert!(hiss > 0.0 || !retried, "station {i} repeated a burst: {:?}", eng[i].log);
         let ptt_lines = host[i].lines.iter().filter(|l| l.starts_with("PTT")).count();
         assert_eq!(ptt_lines, cards[i].lock().unwrap().ptt_events, "PTT lines to host match the real PTT");
     }
@@ -478,52 +537,4 @@ fn watchdog_fires_under_advance_alone() {
         }
     }
     panic!("never unkeyed");
-}
-
-/// `set(false)` may block; audio that arrives meanwhile is processed after it returns.
-#[test]
-fn blocking_ptt_off_is_harmless() {
-    struct SlowOff {
-        card: Shared,
-        delayed: Arc<Mutex<Option<Vec<f32>>>>,
-    }
-    impl Ptt for SlowOff {
-        fn set(&mut self, on: bool) -> io::Result<()> {
-            if !on {
-                // Simulate a radio that confirms un-key slowly: audio that the
-                // caller would have fed during the wait is held and applied after.
-                let mut delayed = self.delayed.lock().unwrap();
-                *delayed = Some(vec![0.0; CHUNK]);
-            }
-            FakePtt(self.card.clone()).set(on)
-        }
-    }
-
-    let card: Shared = Arc::default();
-    let delayed: Arc<Mutex<Option<Vec<f32>>>> = Arc::default();
-    let modem = Arc::new(Modem::new(OfdmParams::narrow(), 0.15));
-    let mut eng = RadioEngine::new(
-        modem,
-        LinkConfig::default(),
-        Box::new(SlowOff { card: card.clone(), delayed: delayed.clone() }),
-        FakeOut(card.clone()),
-        0.05,
-        7,
-    );
-    eng.step(None, vec![HostIn::Line("MYCALL LA1AAA".into()), HostIn::Line("CONNECT LA1AAA LA9ZZZ".into())]);
-    let silence = vec![0.0f32; CHUNK];
-    for _ in 0..2000 {
-        eng.step(Some(&silence), Vec::new());
-        card.lock().unwrap().tick();
-        if let Some(chunk) = delayed.lock().unwrap().take() {
-            // Audio that "arrived" while set(false) blocked is fed after it returns.
-            eng.step(Some(&chunk), Vec::new());
-        }
-        if eng.log.iter().any(|l| l.contains("watchdog") || !eng.transmitting()) && !card.lock().unwrap().ptt {
-            // Engine stayed consistent: no audio leaked with PTT off.
-            assert_eq!(card.lock().unwrap().leaked, 0);
-            return;
-        }
-    }
-    panic!("never finished a transmission");
 }

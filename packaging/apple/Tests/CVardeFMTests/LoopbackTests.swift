@@ -6,7 +6,7 @@ final class LoopbackHost {
     var lines: [String] = []
     var data = Data()
     var queue: [Float] = []
-    var queued: UInt64 = 0
+    /// Samples that really went out. Flushed ones are not counted.
     var played: UInt64 = 0
     var ptt = false
     var modem: OpaquePointer?
@@ -18,11 +18,9 @@ final class LoopbackHost {
                 let count = Int(n)
                 let buf = UnsafeBufferPointer(start: samples, count: count)
                 host.queue.append(contentsOf: buf)
-                host.queued += UInt64(count)
             },
             tx_flush: { ctx in
                 let host = Unmanaged<LoopbackHost>.fromOpaque(ctx!).takeUnretainedValue()
-                host.played = host.queued
                 host.queue.removeAll(keepingCapacity: true)
             },
             ptt: { ctx, on in

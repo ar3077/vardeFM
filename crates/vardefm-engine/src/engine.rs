@@ -222,11 +222,24 @@ impl<S: AudioSink> RadioEngine<S> {
         Ok(engine)
     }
 
-    /// Build a modem for `cfg.mode` and `cfg.txdelay_s`, then [`from_config`].
-    pub fn open(cfg: &EngineConfig, ptt: Box<dyn Ptt>, out: S, seed: u32) -> io::Result<Self> {
+    /// Build a modem for `cfg.mode` and `cfg.txdelay_s`, then [`Self::from_config`].
+    /// `decode_threads` is the number of threads that decode a burst (`None`: one
+    /// per CPU core; 1: decode on the calling thread).
+    pub fn open(
+        cfg: &EngineConfig,
+        decode_threads: Option<usize>,
+        ptt: Box<dyn Ptt>,
+        out: S,
+        seed: u32,
+    ) -> io::Result<Self> {
+        // Before the modem: building its codes takes a while.
+        cfg.check()?;
         let params = OfdmParams::by_name(&cfg.mode).ok_or_else(|| io::Error::other("mode must be narrow or wide"))?;
-        let modem = Arc::new(Modem::new(params, cfg.txdelay_s));
-        Self::from_config(cfg, modem, ptt, out, seed)
+        let mut modem = Modem::new(params, cfg.txdelay_s);
+        if let Some(n) = decode_threads {
+            modem.decode_threads = n;
+        }
+        Self::from_config(cfg, Arc::new(modem), ptt, out, seed)
     }
 
     /// Warn about a bad receive level, at most every [`LEVEL_WARN_EVERY_S`] seconds.

@@ -18,6 +18,11 @@ include = [
   "VFM_MODE_WIDE",
   "VFM_RATE",
   "VFM_LEVEL_COUNT",
+  "VFM_KIND_CONNECT_REQ",
+  "VFM_KIND_CONNECT_ACK",
+  "VFM_KIND_DATA",
+  "VFM_KIND_DISC",
+  "VFM_KIND_DISC_ACK",
 ]
 item_types = ["enums", "structs", "functions", "constants", "opaque"]
 

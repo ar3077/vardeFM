@@ -18,7 +18,20 @@ pub mod station;
 pub use engine::{AudioSink, EngineConfig, HostIn, Ptt, RadioEngine, Report, LEVEL_WINDOW_S, RATE};
 pub use station::{HostOut, Station, TxStart};
 
-pub const VERSION: &str = concat!("VardeFM ", env!("CARGO_PKG_VERSION"));
+macro_rules! version {
+    () => {
+        concat!("VardeFM ", env!("CARGO_PKG_VERSION"))
+    };
+}
+
+pub const VERSION: &str = version!();
+
+/// [`VERSION`] as a C string, for the C ABI.
+pub const VERSION_CSTR: &std::ffi::CStr =
+    match std::ffi::CStr::from_bytes_with_nul(concat!(version!(), "\0").as_bytes()) {
+        Ok(s) => s,
+        Err(_) => panic!("version has a NUL byte"),
+    };
 
 /// Seed for the link's session ids and retry delays. Two stations with the same seed
 /// draw the same ids, and the process id alone repeats between stations started from

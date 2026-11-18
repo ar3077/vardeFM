@@ -1,5 +1,5 @@
 # Builds the release archives for every platform. Called by ci.yml (snapshot
-# builds on every push) and release.yml (tagged releases).
+# builds on every push) and release.yml (tagged releases, with the XCFramework).
 name: Build
 
 on:
@@ -9,6 +9,10 @@ on:
         description: Version in the archive names, e.g. 0.2.0
         type: string
         required: true
+      xcframework:
+        description: Also build the Apple XCFramework (five LTO builds on a macOS runner)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -135,6 +139,7 @@ jobs:
 
   xcframework:
     name: Build Apple XCFramework
+    if: inputs.xcframework
     runs-on: macos-latest
     env:
       IPHONEOS_DEPLOYMENT_TARGET: '16.0'
@@ -147,8 +152,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: xcframework
+      # The version is written into the header, so --verify needs the one that generated it.
       - name: Install cbindgen
-        run: cargo install cbindgen --locked
+        run: cargo install cbindgen --locked --version 0.29.4
       - name: FFI has no desktop dependencies
         run: |
           tree="$(cargo tree -p vardefm-ffi --prefix none --locked)"

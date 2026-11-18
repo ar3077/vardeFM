@@ -18,6 +18,27 @@
 // Wide (9600 data port) mode.
 #define VFM_MODE_WIDE 1
 
+// Sample rate of all audio in and out (Hz).
+#define VFM_RATE 48000
+
+// Number of speed levels: they run from 0 to `VFM_LEVEL_COUNT - 1`.
+#define VFM_LEVEL_COUNT 7
+
+// Burst kind (`kind` in the reports): connection request.
+#define VFM_KIND_CONNECT_REQ 0
+
+// Burst kind: connection accepted.
+#define VFM_KIND_CONNECT_ACK 1
+
+// Burst kind: data and/or acknowledgements.
+#define VFM_KIND_DATA 2
+
+// Burst kind: close the session.
+#define VFM_KIND_DISC 3
+
+// Burst kind: session closed.
+#define VFM_KIND_DISC_ACK 4
+
 // Opaque modem handle.
 typedef struct VfmModem VfmModem;
 
@@ -40,6 +61,7 @@ typedef struct VfmConfig {
 typedef struct VfmTxReport {
   double time_s;
   bool repeat;
+  // One of the `VFM_KIND_*` values.
   uint8_t kind;
   uint8_t level;
   uint8_t codewords;
@@ -53,6 +75,7 @@ typedef struct VfmTxReport {
 // Per-burst receive statistics.
 typedef struct VfmRxReport {
   double time_s;
+  // One of the `VFM_KIND_*` values.
   uint8_t kind;
   uint8_t level;
   uint8_t codewords;
@@ -67,7 +90,8 @@ typedef struct VfmRxReport {
 typedef struct VfmCallbacks {
   // One transmitted burst, 48 kHz mono float samples. Required.
   void (*tx_audio)(void *ctx, const float *samples, uintptr_t n);
-  // Drop any queued transmit audio. Required.
+  // Drop any queued transmit audio. The dropped samples do not count as played
+  // (see `vfm_tx_played`). Required.
   void (*tx_flush)(void *ctx);
   // Key or un-key the radio. May block. Required.
   void (*ptt)(void *ctx, bool on);
@@ -75,7 +99,7 @@ typedef struct VfmCallbacks {
   void (*host_line)(void *ctx, const char *line);
   // Bytes for the host data port. Required.
   void (*host_data)(void *ctx, const uint8_t *data, uintptr_t n);
-  // Diagnostic log line. Optional.
+  // Diagnostic log line: bursts, failures, and warnings about the receive level. Optional.
   void (*log)(void *ctx, const char *line);
   // Structured TX burst report. Optional.
   void (*tx_report)(void *ctx, const struct VfmTxReport *report);
@@ -90,29 +114,43 @@ typedef struct VfmCallbacks {
 // bad mode, etc.).
  struct VfmModem *vfm_new(const struct VfmConfig *cfg, const struct VfmCallbacks *cbs, void *ctx);
 
-// Flush audio, un-key, and free the modem.
+// Flush audio, un-key, and free the modem: `tx_flush` and `ptt(false)` are the
+// last callbacks. Do not use `m` afterwards.
+//
+// May be called from inside a callback. Then no other callback fires any more,
+// and the flush, the un-key and the free happen when the call that fired the
+// callback returns: `ctx` must stay valid until it does.
  void vfm_free(struct VfmModem *m);
 
-// Submit one host command line (without CR). May be called from inside a callback.
+// Submit one host command line (without CR). May be called from inside a callback:
+// the command then runs before the call that fired the callback returns.
  void vfm_command(struct VfmModem *m, const char *line);
 
-// Bytes for the data port. May be called from inside a callback.
+// Bytes for the data port. May be called from inside a callback, like `vfm_command`.
  void vfm_send(struct VfmModem *m, const uint8_t *data, uintptr_t n);
 
 // Feed received audio (48 kHz mono float) and advance the sample clock by `n`.
+//
+// Not for a real-time audio callback: this may decode a burst, allocate, start
+// threads and wait in `ptt`. Ignored (and logged) from inside a callback.
  void vfm_rx_audio(struct VfmModem *m, const float *samples, uintptr_t n);
 
 // Advance the sample clock by `samples` without feeding audio content.
 //
 // Required while keyed when the radio is not delivering RX audio, so the PTT
-// tail and watchdog can fire.
+// tail and watchdog can fire. Ignored (and logged) from inside a callback.
  void vfm_advance(struct VfmModem *m, uint64_t samples);
 
-// Report how many transmit samples have been played so far (absolute total).
-// Clamped to what has been queued. Un-key happens on the next rx/advance call.
+// Report how many transmit samples the host has played so far: a running total
+// since `vfm_new` of samples that really went out, clamped to what was queued.
+//
+// Samples dropped in `tx_flush` were not played: never add them. The count the
+// modem holds when `tx_flush` returns is taken as exact, so a host that reports
+// late should call this from inside `tx_flush`. May be called from inside any
+// callback. Un-key happens on the next rx/advance call.
  void vfm_tx_played(struct VfmModem *m, uint64_t total_samples);
 
-// Library version string, e.g. `"VardeFM 0.3.2"`.
+// Library version string, e.g. `"VardeFM 0.3.2"`. Valid for the life of the program.
  const char *vfm_version(void);
 
 #endif  /* VARDEFM_H */
