@@ -17,6 +17,17 @@
 //! so a detector may occasionally beat it. The gap between `genie` and a detector
 //! approximates what detection costs at that CNR.
 //!
+//! The true position comes from the reference detector, not from the channel: the
+//! simulator's filters are IIR, so there is no single delay to add to the burst
+//! layout, and any point in the cyclic prefix that avoids the channel's tails is as
+//! valid. Each mode prints how many samples the true position lies after the sent
+//! boundary of preamble B, the channel delay (the lag at which the sent and received
+//! audio correlate best), and the difference. At the time of writing the true position
+//! is 31 samples after the boundary in narrow mode and the channel delay is 11, so a
+//! detector that lands on the boundary plus the channel delay is 20 samples from the
+//! true position, inside the ±32 of `hit` but not by much. In wide mode the figures are
+//! 9 and 6, 3 apart, against ±16. Both `hit` and `genie` share that bias.
+//!
 //! A separate pass counts detections and decoded headers per minute on audio that
 //! holds no burst (a carrier at -10 dB CNR, which sounds like an open squelch, a
 //! weak unmodulated carrier, white noise, and keyed tones: 750 + 1500 Hz, a roger
@@ -101,6 +112,18 @@ fn received_ok(m: &Arc<Modem>, rx: &[f32], sent: &Burst) -> bool {
     })
 }
 
+/// `f` searching `rx` from `from`, which must return more than `from` ([`DetectFn`]):
+/// searching on from a detection that returned `from` again would hang the
+/// evaluation, so stop instead. The first search, from 0, is checked as well; a
+/// real detection is never at 0, because preamble B's body follows preamble A.
+fn advance(m: &Modem, f: DetectFn, rx: &[f32], from: usize) -> Option<usize> {
+    let next = f(m, rx, from);
+    if let Some(n) = next {
+        assert!(n > from, "detector returned {n} when searching from {from}: it would loop forever");
+    }
+    next
+}
+
 /// Outcome of one trial: (hit, burst) per detector, then the genie's burst.
 struct Trial {
     det: Vec<(bool, bool)>,
@@ -148,9 +171,47 @@ fn trial(m: &Arc<Modem>, mode: &str, cnr: f32, level: u8, ncw: usize, truth: usi
 /// The channel's delays depend neither on its noise nor on the payload (the burst
 /// layout is fixed by level and size), so one noiseless copy gives it for every trial.
 pub(crate) fn true_position(m: &Modem, mode: &str, level: u8, ncw: usize) -> usize {
+    clean_position(m, &clean_copy(m, mode, level, ncw, 0).1)
+}
+
+/// The true position in `rx`, a noiseless copy from [`clean_copy`]: where the
+/// reference detector finds preamble B.
+fn clean_position(m: &Modem, rx: &[f32]) -> usize {
+    m.ofdm.detect(rx, 0).at.expect("burst not found on a clean channel")
+}
+
+/// The `level` burst of `ncw` codewords with payload `t` as modulated, and as a
+/// noiseless `mode` channel delivers it.
+fn clean_copy(m: &Modem, mode: &str, level: u8, ncw: usize, t: u32) -> (Vec<f32>, Vec<f32>) {
     let clean = FmChannelConfig { cnr_db: None, ..FmChannelConfig::by_name(mode).unwrap() };
-    let tx = m.modulate(&burst(level, ncw, payload_seed(0)));
-    m.ofdm.detect(&transmit(&clean, &tx), 0).at.expect("burst not found on a clean channel")
+    let tx = m.modulate(&burst(level, ncw, payload_seed(t)));
+    let rx = transmit(&clean, &tx);
+    (tx, rx)
+}
+
+/// Where the true position lies against the channel, from one noiseless copy: (the
+/// true position as [`true_position`] finds it, samples after the sent boundary of
+/// preamble B's body, channel delay in samples).
+///
+/// The boundary is counted back from the end of the modulated burst, so the leader
+/// and preambles come from the modulator itself: preamble B's body ends where the
+/// header and codeword symbols start. The channel delay is the lag up to one cyclic
+/// prefix at which the received copy correlates best with what was sent. Neither
+/// depends on any detector. The correlation is signed: the simulated channel does
+/// not invert the audio. A delay of 0 or a whole cyclic prefix is the edge of the
+/// search, not a peak.
+fn position_check(m: &Modem, mode: &str, level: u8, ncw: usize) -> (usize, i64, usize) {
+    let cfg = FmChannelConfig::by_name(mode).unwrap();
+    let p = &m.ofdm.p;
+    let (tx, rx) = clean_copy(m, mode, level, ncw, 0);
+    let truth = clean_position(m, &rx);
+    let lead = (cfg.lead_silence_s * cfg.fs) as usize;
+    let data = m.header_symbols() + ncw * m.symbols_per_codeword(level);
+    let boundary = lead + tx.len() - data * p.symbol_len() - p.nfft;
+    let rx = &rx[lead..];
+    let corr = |d: usize| -> f64 { tx.iter().zip(&rx[d..]).map(|(&a, &b)| a as f64 * b as f64).sum() };
+    let delay = (0..=p.ncp).map(|d| (corr(d), d)).max_by(|a, b| a.0.total_cmp(&b.0)).unwrap().1;
+    (truth, truth as i64 - boundary as i64, delay)
 }
 
 /// `f(t)` for every trial `t` in `0..trials`, spread over every core, in trial
@@ -168,9 +229,9 @@ pub(crate) fn on_every_core<R: Send>(trials: u32, f: impl Fn(u32) -> R + Sync) -
     out.into_iter().map(|(_, r)| r).collect()
 }
 
-/// Run `trials` trials of a `level` burst of `ncw` codewords on every core.
-fn run_trials(m: &Arc<Modem>, mode: &str, cnr: f32, level: u8, ncw: usize, trials: u32) -> Vec<Trial> {
-    let truth = true_position(m, mode, level, ncw);
+/// Run `trials` trials of a `level` burst of `ncw` codewords on every core, with
+/// preamble B at `truth` ([`true_position`]).
+fn run_trials(m: &Arc<Modem>, mode: &str, cnr: f32, level: u8, ncw: usize, truth: usize, trials: u32) -> Vec<Trial> {
     on_every_core(trials, |t| trial(m, mode, cnr, level, ncw, truth, t))
 }
 
@@ -191,11 +252,22 @@ fn mcnemar(b: u32, c: u32) -> f64 {
 }
 
 /// Environment variable `name` parsed as `T`, or `default` when unset. A value that
-/// does not parse stops the run: falling back would quietly run something else.
+/// does not parse, or is not Unicode, stops the run: falling back would quietly run
+/// something else.
 pub(crate) fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
+    match env_var(name) {
+        Some(v) => v.trim().parse().unwrap_or_else(|_| panic!("{name}={v:?} does not parse")),
+        None => default,
+    }
+}
+
+/// Environment variable `name`, or `None` when unset. A value that is not Unicode
+/// stops the run rather than reading as unset.
+fn env_var(name: &str) -> Option<String> {
     match std::env::var(name) {
-        Ok(v) => v.trim().parse().unwrap_or_else(|_| panic!("{name}={v:?} does not parse")),
-        Err(_) => default,
+        Ok(v) => Some(v),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(v)) => panic!("{name}={v:?} is not Unicode"),
     }
 }
 
@@ -205,7 +277,7 @@ pub(crate) fn env_list<T: std::str::FromStr>(name: &str, default: &str) -> Vec<T
 where
     T::Err: std::fmt::Display,
 {
-    let v = std::env::var(name).unwrap_or_else(|_| default.to_string());
+    let v = env_var(name).unwrap_or_else(|| default.to_string());
     v.split(',').map(|s| s.trim().parse().unwrap_or_else(|e| panic!("{name}: {s:?}: {e}"))).collect()
 }
 
@@ -222,10 +294,10 @@ pub(crate) fn env_modes(default: &str) -> Vec<String> {
 /// Environment variable `name` as a switch: unset, `0` or `false` is off, `1` or
 /// `true` is on. Anything else stops the run, as with [`env_or`].
 pub(crate) fn env_flag(name: &str) -> bool {
-    match std::env::var(name).as_deref().map(str::trim) {
-        Err(_) | Ok("0" | "false") => false,
-        Ok("1" | "true") => true,
-        Ok(v) => panic!("{name}={v:?}: use 1 or 0"),
+    match env_var(name).as_deref().map(str::trim) {
+        None | Some("0" | "false") => false,
+        Some("1" | "true") => true,
+        Some(v) => panic!("{name}={v:?}: use 1 or 0"),
     }
 }
 
@@ -281,15 +353,21 @@ fn noise_case(mode: &str, case: usize, seconds: f32, fs: f32) -> Vec<f32> {
 }
 
 /// Detections and decoded headers in `rx`, scanning on after each detection.
+///
+/// It searches on from each detection itself, as `Receiver::step` does after a header
+/// that fails (where Schmidl-Cox's `Detection::resume` puts it), so a detector is scored here on the searches it makes
+/// in the receiver. After a header that decodes the receiver skips the frame it
+/// announces; this pass searches on from the detection instead, so that every
+/// detection in the audio is counted.
 fn false_detections(m: &Modem, f: DetectFn, rx: &[f32]) -> (u32, u32) {
     let (mut dets, mut headers) = (0, 0);
-    let mut pos = 0;
-    while let Some(b) = f(m, rx, pos) {
+    let mut next = advance(m, f, rx, 0);
+    while let Some(b) = next {
         dets += 1;
         if header_at(m, rx, b).is_some() {
             headers += 1;
         }
-        pos = b + 1;
+        next = advance(m, f, rx, b);
     }
     (dets, headers)
 }
@@ -304,19 +382,43 @@ fn detector_eval() {
     let noise_s: f32 = env_or("NOISE_SECONDS", 60.0);
     assert!((level as usize) < LEVELS.len(), "LEVEL {level}: levels are 0 to {}", LEVELS.len() - 1);
     assert!(trials > 0, "TRIALS must be at least 1");
-    assert!(noise_s > 0.0, "NOISE_SECONDS={noise_s}: must be more than 0");
+    assert!(noise_s > 0.0 && noise_s.is_finite(), "NOISE_SECONDS={noise_s}: must be a finite number more than 0");
     let modes: Vec<&str> = modes.iter().map(String::as_str).collect();
+    // Checked up front, so that a bad NCW does not fail after the first mode has run.
+    let modems: Vec<Arc<Modem>> = modes
+        .iter()
+        .map(|mode| {
+            let m = modem(mode);
+            // A longer burst would modulate, but its header would not unpack (MAX_NCW) or
+            // the modem would never send it (MAX_PAYLOAD_SECONDS): every trial would fail.
+            let max = m.max_ncw(level);
+            assert!(ncw <= max, "NCW {ncw}: a level {level} burst in {mode} mode holds at most {max} codewords");
+            m
+        })
+        .collect();
     let cnr_list = |mode: &str| -> Vec<f32> {
         let default = if mode == "narrow" { "3,4,5,6,7,8,10" } else { "5,6,7,8,9,10,12" };
-        env_list("CNRS", default)
+        let cnrs: Vec<f32> = env_list("CNRS", default);
+        for c in &cnrs {
+            // NaN or infinite noise gives an all-NaN recording, which would be written as data.
+            assert!(c.is_finite(), "CNRS: {c} is not a finite number of dB");
+        }
+        cnrs
     };
     for mode in &modes {
         cnr_list(mode);
     }
-    let mut csv = std::env::var("CSV").ok().map(|p| {
-        let new = !std::path::Path::new(&p).exists();
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(p).unwrap();
-        if new {
+    // Any path the OS accepts, Unicode or not.
+    let mut csv = std::env::var_os("CSV").map(|p| {
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&p)
+            .unwrap_or_else(|e| panic!("CSV: cannot open {p:?}: {e}"));
+        // An empty file (from mktemp, say) needs the header as much as a new one. A pipe
+        // or a terminal always reads as empty, so it gets none rather than one per run.
+        let meta = f.metadata().unwrap_or_else(|e| panic!("CSV: cannot read {p:?}: {e}"));
+        if meta.is_file() && meta.len() == 0 {
             writeln!(f, "mode,level,ncw,cnr_db,trials,detector,hits,bursts").unwrap();
         }
         f
@@ -326,15 +428,19 @@ fn detector_eval() {
         "level {level} ({}), {ncw} codeword(s), {trials} trials per point, txdelay {TXDELAY} s",
         LEVELS[level as usize].name
     );
-    for &mode in &modes {
-        let m = modem(mode);
-        // A longer burst would modulate, but its header would not unpack (MAX_NCW) or
-        // the modem would never send it (MAX_PAYLOAD_SECONDS): every trial would fail.
-        let max = m.max_ncw(level);
-        assert!(ncw <= max, "NCW {ncw}: a level {level} burst in {mode} mode holds at most {max} codewords");
+    for (&mode, m) in modes.iter().zip(modems) {
         println!("\n{mode}: hits and decoded bursts out of {trials}; paired test against '{}'", names[0]);
+        // The true position is the reference's own; show where it lies against the channel.
+        let (truth, after, delay) = position_check(&m, mode, level, ncw);
+        println!(
+            "  true position: sample {truth}, {after} after the sent boundary; channel delay {delay}{}, \
+             so {} after the boundary plus the delay; hit within ±{}",
+            if delay == 0 || delay == m.ofdm.p.ncp { " (edge of the search, not a peak)" } else { "" },
+            after - delay as i64,
+            m.ofdm.p.ncp / 4
+        );
         for cnr in cnr_list(mode) {
-            let res = run_trials(&m, mode, cnr, level, ncw, trials);
+            let res = run_trials(&m, mode, cnr, level, ncw, truth, trials);
             let genie = res.iter().filter(|r| r.genie).count();
             let mut line = format!("  CNR {cnr:5.1} dB  genie {genie:4}");
             for (d, name) in names.iter().enumerate() {
@@ -382,14 +488,22 @@ fn on_every_core_keeps_trial_order() {
 fn harness_sees_strong_bursts_and_no_false_headers() {
     for mode in ["narrow", "wide"] {
         let m = modem(mode);
+        let (truth, after, delay) = position_check(&m, mode, 1, 1);
         // The true position must not depend on the payload, or one copy could not give it.
-        let truth = true_position(&m, mode, 1, 1);
-        let clean = FmChannelConfig { cnr_db: None, ..FmChannelConfig::by_name(mode).unwrap() };
+        // `position_check` finds it as `true_position` does: `clean_position` on payload 0.
         for t in 1..4 {
-            let tx = m.modulate(&burst(1, 1, payload_seed(t)));
-            assert_eq!(m.ofdm.detect(&transmit(&clean, &tx), 0).at, Some(truth), "{mode}: payload {t} moves the burst");
+            let pos = clean_position(&m, &clean_copy(&m, mode, 1, 1, t).1);
+            assert_eq!(pos, truth, "{mode}: payload {t} moves the burst");
         }
-        for r in run_trials(&m, mode, 25.0, 1, 1, 4) {
+        // The printed cross-check must stay meaningful: the true position lies within a
+        // cyclic prefix of the sent boundary plus the channel delay.
+        let ncp = m.ofdm.p.ncp as i64;
+        assert!(delay > 0 && (delay as i64) < ncp, "{mode}: channel delay {delay} is the edge of the 0..={ncp} search");
+        assert!(
+            (after - delay as i64).abs() <= ncp,
+            "{mode}: true position {after} after the sent boundary, channel delay {delay}: more than {ncp} apart"
+        );
+        for r in run_trials(&m, mode, 25.0, 1, 1, truth, 4) {
             assert!(r.genie, "{mode}: genie failed on a strong signal");
             assert!(r.det.iter().all(|&(_, ok)| ok), "{mode}: a detector missed a strong burst");
         }
