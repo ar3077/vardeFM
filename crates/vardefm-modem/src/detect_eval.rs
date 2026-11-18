@@ -48,6 +48,8 @@ use vardefm_dsp::prng::Prng;
 use vardefm_sim::{transmit, FmChannelConfig};
 
 /// A burst detector: search `rx` from `from`, return where the body of preamble B starts.
+/// A position it returns must be more than `from`: the evaluation searches on from a
+/// detection, so one that returned `from` would search forever.
 pub(crate) type DetectFn = fn(&Modem, &[f32], usize) -> Option<usize>;
 
 /// Detectors under evaluation. The first one is the reference for the paired tests.
@@ -354,9 +356,11 @@ fn noise_case(mode: &str, case: usize, seconds: f32, fs: f32) -> Vec<f32> {
 
 /// Detections and decoded headers in `rx`, scanning on after each detection.
 ///
-/// It searches on from each detection itself, as `Receiver::step` does after a header
-/// that fails (where Schmidl-Cox's `Detection::resume` puts it), so a detector is scored here on the searches it makes
-/// in the receiver. After a header that decodes the receiver skips the frame it
+/// It searches on from each detection itself. `DetectFn` gives only `Detection::at`,
+/// so this takes `at` as the resume point, which holds for Schmidl-Cox only: its
+/// `resume` is its detection, so `Receiver::step` searches on from there too after a
+/// header that fails, and the detector is scored here on the searches it makes in
+/// the receiver. After a header that decodes the receiver skips the frame it
 /// announces; this pass searches on from the detection instead, so that every
 /// detection in the audio is counted.
 fn false_detections(m: &Modem, f: DetectFn, rx: &[f32]) -> (u32, u32) {
