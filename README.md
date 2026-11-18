@@ -15,6 +15,8 @@ warnings from mountaintop to mountaintop.
   document for the differences from VARA.
 - **Not on-air compatible with VARA:** both stations need VardeFM.
 
+Video explaining how the software works [VardeFM under the hood](https://www.youtube.com/watch?v=TU3rt4h6phA)
+
 ## Download and use
 
 Get the archive for your system from the [releases page](https://github.com/notepid/vardeFM/releases):
@@ -88,8 +90,10 @@ vardefm sim-pair --cnr 18 --ppm -40 --record wavs
 | `--keyup <s>`, `--txdelay <s>` | radio key-up time and the modem's leader (must be longer) |
 | `--a-port`, `--b-port` | command ports (data = +1); defaults 8300 and 8310 |
 | `--speed <x>` | run x times faster than real time (0 = as fast as possible) |
-| `--record <dir>` | save each transmission as `NNNN_<A\|B>_tx.wav` and `_rx.wav` |
+| `--record <dir>` | save each transmission as `NNNN_<A\|B>_tx.wav` and `_rx.wav`; with `--digi` as `NNNN_<from>_tx.wav` and `NNNN_<from>_rx_<to>.wav`, the digipeaters being `D1` and `D2` |
 | `--seed <n>` | noise seed |
+| `--digi <call>` | put a digipeater between A and B (repeat for up to 2); A and B then hear only their neighbours |
+| `--hop-margin <s>` | extra wait per digipeater on A and B (default 0.5, at most 10) |
 
 It prints one line per transmission and per reception:
 ```
@@ -189,4 +193,18 @@ commits. A tag with a suffix such as `v0.3.0-rc1` becomes a pre-release.
 
 ## License
 
-GPL-3.0-or-later; see [LICENSE](LICENSE). The CM108 PTT support follows Dire Wolf by WB2OSZ.
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <https://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
+
+at your option. Releases up to and including 0.3.2 were published under GPL-3.0-or-later.
+
+The CM108 PTT support uses the USB IDs and HID report format documented in Dire Wolf by
+WB2OSZ.
+
+### Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for
+inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed
+as above, without any additional terms or conditions.

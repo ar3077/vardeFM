@@ -192,7 +192,7 @@ fn survives_a_click() {
     let a = 3.0 * rms * 3f32.sqrt();
     let mut rng = Prng::new(77);
     for x in &mut audio[from..from + l] {
-        *x = a * (rng.next_u32() as f32 / u32::MAX as f32 * 2.0 - 1.0);
+        *x = a * rng.uniform();
     }
 
     let known = m.header_carriers(&b.header);
@@ -234,8 +234,12 @@ fn header_only_burst_reports_the_same_snr() {
         eprintln!("{mode}: header-only {:.2} dB, data {:.2} dB", snr[0], snr[1]);
         // A data burst's SNR includes the clipping noise of its payload symbols (the
         // per-symbol noise scale picks them up), which a header-only burst cannot see:
-        // about 0.8 dB in narrow mode at the 0.30 drive, 0.3 dB at 0.20.
-        assert!((snr[0] - snr[1]).abs() < 1.0, "{mode}: header-only {:.1} dB, data {:.1} dB", snr[0], snr[1]);
+        // about 0.8 dB in narrow mode at the 0.30 drive, 0.3 dB at 0.20. So the header-only
+        // burst reads the same or a little higher, not meaningfully lower: measured without
+        // the header as training it reads 0.49 dB (narrow) and 0.97 dB (wide) lower, which
+        // a symmetric 1 dB bound lets through.
+        let diff = snr[0] - snr[1];
+        assert!(diff > -0.25 && diff < 1.0, "{mode}: header-only {:.2} dB, data {:.2} dB", snr[0], snr[1]);
     }
 }
 
@@ -273,7 +277,7 @@ fn survives_a_click_in_the_header() {
     let mut audio = clean.clone();
     let mut rng = Prng::new(78);
     for x in &mut audio[from..from + l] {
-        *x = a * (rng.next_u32() as f32 / u32::MAX as f32 * 2.0 - 1.0);
+        *x = a * rng.uniform();
     }
 
     let known = m.header_carriers(&b.header);

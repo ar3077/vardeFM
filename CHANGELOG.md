@@ -6,7 +6,30 @@ run the same minor version.
 
 ## [Unreleased]
 
+### Changed
+- **License.** VardeFM is now dual licensed under MIT OR Apache-2.0, at your option, so it
+  can be embedded as a library in any application, including closed-source ones (#19). Releases up to and including
+  0.3.2 remain available under GPL-3.0-or-later.
+
+## [0.3.2] - 2026-11-16
+
+On-air compatible with 0.3.0 and 0.3.1 for direct sessions. Digipeating is new and
+experimental: how a routed session looks on air may change in the next release, so the
+end stations and the digipeaters of a routed session should all run 0.3.2.
+
 ### Added
+- **Digipeating.** `CONNECT <mycall> <target> VIA <d1> [<d2>]` connects through up to
+  two VardeFM digipeaters, as in VARA FM. `vardefm modem --digi <call>` makes a
+  station repeat the sessions routed through that call, with or without a host
+  connected. Each digipeater repeats every burst; acknowledgements and retries stay end
+  to end, and a codeword a digipeater could not decode is passed on as void so the
+  sender resends it. The end stations wait longer before retrying, by the repeats' airtime
+  plus `--hop-margin` (default 0.5 s) per digipeater. `sim-pair --digi <call>` puts
+  digipeaters between A and B, which then hear only their neighbours. On air, every burst
+  of a routed session is marked in new header flag bits, and its connect bursts carry a
+  `VFM2` payload; direct sessions are unchanged and still work with older builds, and
+  digipeaters never repeat them. See docs/PROTOCOL.md §3.4. (#24, #31, reviewed by
+  @mustig)
 - **Performance gates.** `level_gate` and `fer_gate` are ignored tests, run by hand in
   release mode, that fail when decoding performance moves. Per mode and level, the CNR
   at which 10 % of codewords fail, and per mode and drive level the CNR at which 10 % of
@@ -14,7 +37,10 @@ run the same minor version.
   `crates/vardefm-modem/perf/levels.toml`; per LDPC code, the Eb/N0 of 1 % FER in
   `crates/vardefm-fec/perf/ldpc.toml`. `level_sweep` and `fer_curve` with `WRITE=1`
   record them again. The figures in `docs/PROTOCOL.md` §2.2 and §2.4 now refer to these
-  files.
+  files. (#13, thanks @mustig)
+- **Detector harness.** `detector_eval` is an ignored test that measures how often a burst
+  detector leads to a decoded burst, against decoding from the known burst position. It
+  changes nothing in the modem. (#6, thanks @mustig)
 
 ### Changed
 - **Busy detection measures only the carrier band** (422–2672 Hz narrow, 400–6000 Hz wide).
@@ -28,6 +54,9 @@ run the same minor version.
   the tone came back abruptly and the band filter read that as busy for 150 ms after
   every burst, which held back the modem's next transmission. A busy hold from before a
   transmission no longer carries over it. (#10)
+- On the radio, session ids and retry delays are seeded from the operating system's
+  randomness. The process id alone could repeat between stations started from the same
+  system image, which then drew the same session ids.
 
 ### Fixed
 - A CTCSS tone in the received audio no longer hides bursts from detection. Detection
@@ -40,6 +69,16 @@ run the same minor version.
 - A NaN, an Inf or a sample far beyond full scale from the sound card no longer loses a
   burst it falls in or shortly before, and cannot leave busy detection deaf; the last
   good sample takes its place. (#10)
+- A transfer could stop for good, with the session still connected, after lost bursts
+  and a change of speed level. When data that had arrived ahead of a gap was sent again
+  at a faster level, the receiver acknowledged the longer copy but kept the shorter one,
+  so the sender never sent the difference again. Only the receiving side changes: a
+  station with this fix receives correctly from any version. (#29, thanks @mustig)
+- Two stations talking directly could drop their session when both started a burst at
+  the same moment. Both then retried after the same wait, within 0.4 s of each other,
+  and a retry did not give way to a busy channel, so every retry collided. A retry now
+  gives way, as it already did through digipeaters, and answers the other end's burst
+  instead. In the simulator this dropped 1 run in 4 with both ends sending at once.
 
 ## [0.3.1] - 2026-11-09
 
@@ -129,7 +168,8 @@ correction with seven speed levels, selective-repeat ARQ link layer, VARA-compat
 host interface, `sim-pair` virtual radio pair, sound card I/O with serial, CM108 and
 GPIO PTT, and release builds for Windows, Linux and Raspberry Pi.
 
-[Unreleased]: https://github.com/notepid/vardeFM/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/notepid/vardeFM/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/notepid/vardeFM/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/notepid/vardeFM/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/notepid/vardeFM/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/notepid/vardeFM/compare/v0.2.0...v0.2.1
