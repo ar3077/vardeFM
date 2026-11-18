@@ -1262,8 +1262,16 @@ fn caller_does_not_join_a_session_it_hears() {
     let (to_b, to_a) = (data(3000, 1), data(3000, 2));
     net.nodes[A].node.link.send_data(&to_b);
     net.nodes[b].node.link.send_data(&to_a);
-    // Every poll draws from the generator, so set it just before the pick.
-    let seed = (0..u32::MAX).find(|&s| Prng::new(s).next_u32() % 255 + 1 == id as u32).unwrap();
+    // Every poll draws from the generator, so set it just before the pick. The seed is
+    // one with which a caller that has heard nothing picks A and B's id.
+    let unaware_pick = |seed| {
+        let mut fresh = Link::new(net.modem.clone(), LinkConfig::default(), 0);
+        fresh.rng = Prng::new(seed);
+        fresh.connect(net.now, "LA5CCC", "LA9ZZZ", &[]).unwrap();
+        let State::Connecting { session, .. } = fresh.state else { panic!("not connecting") };
+        session
+    };
+    let seed = (0..10_000).find(|&s| unaware_pick(s) == id).expect("no seed picks the id");
     net.nodes[c].node.link.rng = Prng::new(seed);
     net.nodes[c].node.link.connect(net.now, "LA5CCC", "LA9ZZZ", &[]).unwrap();
     let State::Connecting { session, .. } = net.nodes[c].node.link.state else { panic!("not connecting") };
