@@ -72,6 +72,10 @@ const SEGMENT_HEADER: usize = 4;
 const RETRY_BACKOFF_S: f64 = 0.4;
 /// Largest random addition to the wait between connect requests.
 const CONNECT_JITTER_S: f64 = 0.5;
+/// A caller does not pick a session id it has heard in this many seconds, so it does not
+/// share an id with a session on the channel (issue #27). The same time a digipeater keeps
+/// an idle session.
+const HEARD_ID_S: f64 = 600.0;
 /// Largest `hop_margin_s`. A digipeater does not know the end stations' margin, so the
 /// lifetimes of its sessions are sized for this one.
 pub const MAX_HOP_MARGIN_S: f64 = 10.0;
@@ -273,6 +277,8 @@ pub struct Link {
     oneshot: Option<Burst>,
     /// Recently closed session, so a repeated Disc can still be answered.
     closed: Option<(u8, Route)>,
+    /// When each session id was last heard on the channel, in any burst.
+    heard_ids: [f64; 256],
     /// Longest burst any level can send, seconds.
     max_burst_s: f64,
     last_tx: TxInfo,
@@ -305,6 +311,7 @@ impl Link {
             rng: Prng::new(seed),
             oneshot: None,
             closed: None,
+            heard_ids: [f64::NEG_INFINITY; 256],
             last_tx: TxInfo::default(),
             stats: LinkStats::default(),
         }
@@ -409,7 +416,7 @@ impl Link {
         if !self.is_idle() || via.len() > MAX_DIGIS {
             return Err(());
         }
-        let session = (self.rng.next_u32() % 255 + 1) as u8;
+        let session = self.pick_session_id(now);
         self.state = State::Connecting {
             session,
             mycall: norm_call(mycall),
@@ -420,6 +427,18 @@ impl Link {
             sending: false,
         };
         Ok(())
+    }
+
+    /// A random non-zero session id not heard in the last [`HEARD_ID_S`]. If every id
+    /// has been heard, any non-zero id.
+    fn pick_session_id(&mut self, now: f64) -> u8 {
+        let free: Vec<u8> = (1..=255).filter(|&id| now - self.heard_ids[id as usize] > HEARD_ID_S).collect();
+        let n = self.rng.next_u32();
+        if free.is_empty() {
+            (n % 255 + 1) as u8
+        } else {
+            free[n as usize % free.len()]
+        }
     }
 
     /// Graceful close: send everything still queued, then close the session.
@@ -486,6 +505,7 @@ impl Link {
             rx
         };
         let h = rx.header;
+        self.heard_ids[h.session as usize] = now;
         self.stats.codewords_received += rx.payload.len() as u64;
         self.stats.codewords_failed += rx.payload.iter().filter(|p| p.is_none()).count() as u64;
         let req = self.level_for(rx);
