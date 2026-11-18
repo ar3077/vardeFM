@@ -771,14 +771,12 @@ impl Link {
 
     /// Called regularly while not transmitting. Returns a burst to transmit now.
     pub(crate) fn poll(&mut self, now: f64, busy: bool) -> Option<Burst> {
-        if !self.is_idle() {
+        // A new session, or a Disc too late to send, drops the parting Disc.
+        if !self.is_idle() || self.parting.as_ref().is_some_and(|&(until, _)| now > until) {
             self.parting = None;
         }
-        if self.parting.as_ref().is_some_and(|&(until, _)| now > until) {
-            self.parting = None;
-        }
-        let parting = || if busy { None } else { self.parting.take().map(|(_, b)| b) };
-        if let Some(b) = self.oneshot.take().or_else(parting) {
+        let quiet_parting = || if busy { None } else { self.parting.take().map(|(_, b)| b) };
+        if let Some(b) = self.oneshot.take().or_else(quiet_parting) {
             self.last_tx = TxInfo { kind: b.header.kind, ..TxInfo::default() };
             self.stats.bursts_sent += 1;
             return Some(b);

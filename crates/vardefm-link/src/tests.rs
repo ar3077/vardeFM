@@ -211,6 +211,15 @@ impl Net {
         self.nodes[i].events.contains(e)
     }
 
+    /// Sets who hears whom: station `to` hears `from` if `f(to, from)`.
+    fn set_hears(&mut self, f: impl Fn(usize, usize) -> bool) {
+        for (to, row) in self.hears.iter_mut().enumerate() {
+            for (from, h) in row.iter_mut().enumerate() {
+                *h = f(to, from);
+            }
+        }
+    }
+
     fn both_connected(&self) -> bool {
         self.nodes[A].node.link.is_connected() && self.nodes[self.b()].node.link.is_connected()
     }
@@ -388,11 +397,7 @@ fn endpoints_that_hear_each_other_ignore_the_direct_copy() {
     // although A and B also decode each other's bursts directly.
     let digis = ["LA3DDD"];
     let mut net = Net::chain(31, 0.0, &digis, LinkConfig::default());
-    for (to, row) in net.hears.iter_mut().enumerate() {
-        for (from, h) in row.iter_mut().enumerate() {
-            *h = to != from;
-        }
-    }
+    net.set_hears(|to, from| to != from);
     routed_session(net, &digis, 31);
 }
 
@@ -1162,16 +1167,12 @@ fn jammed_with(seed: u32, digis: &[&str], disc: bool, gaps: bool, cfg: LinkConfi
     (net.has(A, &LinkEvent::Disconnected).then_some(net.now - t0), limit)
 }
 
-/// As `jammed_with` on the default config, and checks A dropped after the busy timeout
-/// for its route, but no later than that plus some slack.
-fn jammed(seed: u32, digis: &[&str], disc: bool) {
-    jammed_cfg(seed, digis, disc, LinkConfig::default());
-}
-
-fn jammed_cfg(seed: u32, digis: &[&str], disc: bool, cfg: LinkConfig) {
-    let (t, limit) = jammed_with(seed, digis, disc, false, cfg);
+/// As `jammed_with`, and checks A dropped after the busy timeout for its route, but no
+/// later than that plus some slack.
+fn jammed(seed: u32, digis: &[&str], disc: bool, gaps: bool, cfg: LinkConfig) {
+    let (t, limit) = jammed_with(seed, digis, disc, gaps, cfg);
     let t = t.unwrap_or_else(|| panic!("A still in session after 900 s on a jammed channel via {digis:?}"));
-    assert!(t > limit && t < limit + 5.0, "via {digis:?}, disc {disc}: took {t:.0} s, limit {limit:.0} s");
+    assert!(t > limit && t < limit + 5.0, "via {digis:?}, disc {disc}, gaps {gaps}: took {t:.0} s, limit {limit:.0} s");
 }
 
 #[test]
@@ -1179,17 +1180,17 @@ fn direct_retry_gives_up_on_a_jammed_channel() {
     // The peer goes silent and the channel then stays busy (a carrier, or a station we
     // are not talking to). A retry that gives way to a busy channel must still be
     // bounded: the session has to drop rather than wait for the channel forever.
-    jammed(1, &[], false);
+    jammed(1, &[], false, false, LinkConfig::default());
 }
 
 #[test]
 fn routed_retry_and_pending_disc_give_up_on_a_jammed_channel() {
     for (i, digis) in [&["LA3DDD"][..], &["LA3DDD", "LA4EEE-2"]].iter().enumerate() {
         for disc in [false, true] {
-            jammed(50 + i as u32, digis, disc);
+            jammed(50 + i as u32, digis, disc, false, LinkConfig::default());
         }
     }
-    jammed(52, &[], true);
+    jammed(52, &[], true, false, LinkConfig::default());
 }
 
 #[test]
@@ -1252,11 +1253,7 @@ fn busy_timeout_never_drops_a_working_session() {
             let seed = 60 + i as u32;
             let mut net = Net::chain(seed, 0.05, digis, cfg.clone());
             if all_hear {
-                for (to, row) in net.hears.iter_mut().enumerate() {
-                    for (from, h) in row.iter_mut().enumerate() {
-                        *h = to != from;
-                    }
-                }
+                net.set_hears(|to, from| to != from);
             }
             routed_session(net, digis, seed);
         }
@@ -1299,9 +1296,7 @@ fn short_quiet_gaps_do_not_keep_a_jammed_session_open() {
     // A carrier that drops out for a moment every 30 s: each gap is too short for the
     // held-back retry to go out, so it is no progress and the session must still drop.
     for (i, digis) in [&[][..], &["LA3DDD"], &["LA3DDD", "LA4EEE-2"]].iter().enumerate() {
-        let (t, limit) = jammed_with(80 + i as u32, digis, false, true, LinkConfig::default());
-        let t = t.unwrap_or_else(|| panic!("via {digis:?}: still in session after 900 s"));
-        assert!(t > limit && t < limit + 5.0, "via {digis:?}: took {t:.0} s, limit {limit:.0} s");
+        jammed(80 + i as u32, digis, false, true, LinkConfig::default());
     }
 }
 
@@ -1312,8 +1307,8 @@ fn a_long_keepalive_does_not_delay_the_drop_when_something_is_held_back() {
     for keepalive_s in [600.0, f64::INFINITY] {
         let cfg = LinkConfig { keepalive_s, ..LinkConfig::default() };
         for disc in [false, true] {
-            jammed_cfg(90, &[], disc, cfg.clone());
-            jammed_cfg(91, &["LA3DDD"], disc, cfg.clone());
+            jammed(90, &[], disc, false, cfg.clone());
+            jammed(91, &["LA3DDD"], disc, false, cfg.clone());
         }
     }
 }
@@ -1333,29 +1328,39 @@ fn connect_gives_up_on_a_jammed_channel() {
     }
 }
 
-#[test]
-fn dropped_session_sends_a_disc_once_the_channel_is_quiet() {
-    // A direct session, plus a third station (index 1, not on the route) whose carrier
-    // only A hears. B hears A, but A cannot decode B under the carrier, so A drops the
-    // session. B is alive: A tells it with a Disc, but not into the carrier.
+/// Station 1 of a chain via one digipeater, which `jammed_live_peer` uses as a jammer.
+const JAMMER: usize = 1;
+
+/// A direct session, plus a third station (`JAMMER`, not on the route) whose carrier
+/// only A hears. B hears A, but A cannot decode B under the carrier, so A drops the
+/// session. Runs until A has dropped, and returns the net and when the carrier began.
+fn jammed_live_peer(seed: u32) -> (Net, f64) {
     let cfg = LinkConfig { keepalive_s: 600.0, ..LinkConfig::default() };
-    let mut net = Net::chain(110, 0.0, &["LA3DDD"], cfg);
-    let (b, jammer) = (net.b(), 1);
-    for (to, row) in net.hears.iter_mut().enumerate() {
-        for (from, h) in row.iter_mut().enumerate() {
-            *h = to != from && !(from == jammer && to != A);
-        }
-    }
+    let mut net = Net::chain(seed, 0.0, &["LA3DDD"], cfg);
+    net.set_hears(|to, from| to != from && !(from == JAMMER && to != A));
     net.nodes[A].node.link.connect(0.0, "LA1AAA", "LA2BBB-1", &[]).unwrap();
     net.run_until(60.0, |n| n.both_connected());
     net.run_until(60.0, |n| n.now > 20.0 && n.nodes.iter().all(|x| x.tx.is_none()));
     let start = net.now;
-    net.history.push((jammer, start, start + 1000.0));
-    net.nodes[A].node.link.send_data(&data(200, 110));
+    net.history.push((JAMMER, start, start + 1000.0));
+    net.nodes[A].node.link.send_data(&data(200, seed));
     net.run_until(300.0, |n| n.has(A, &LinkEvent::Disconnected));
+    (net, start)
+}
+
+/// Ends the jammer's carrier, which began at `start`, at `end` instead.
+fn end_jam(net: &mut Net, start: f64, end: f64) {
+    net.history.retain(|&(g, ..)| g != JAMMER);
+    net.history.push((JAMMER, start, end));
+}
+
+#[test]
+fn dropped_session_sends_a_disc_once_the_channel_is_quiet() {
+    // B is alive: A tells it with a Disc, but not into the carrier.
+    let (mut net, start) = jammed_live_peer(110);
+    let b = net.b();
     let end = net.now + 5.0;
-    net.history.retain(|&(g, ..)| g != jammer);
-    net.history.push((jammer, start, end));
+    end_jam(&mut net, start, end);
     net.run_until(30.0, |n| n.has(b, &LinkEvent::Disconnected));
     let discs: Vec<f64> = net.sent.iter().filter(|&&(from, .., k)| from == A && k == Kind::Disc).map(|x| x.1).collect();
     assert_eq!(discs.len(), 1, "A's Discs at {discs:?}");
@@ -1382,26 +1387,11 @@ fn new_connect_attempt_does_not_inherit_the_held_back_timer() {
 
 #[test]
 fn a_disc_held_back_past_the_busy_timeout_is_not_sent() {
-    // As above, but the carrier outlasts the drop by more than the busy timeout. A Disc
-    // that late could end the peer's next session if it got the same id: drop it.
-    let cfg = LinkConfig { keepalive_s: 600.0, ..LinkConfig::default() };
-    let mut net = Net::chain(120, 0.0, &["LA3DDD"], cfg);
-    let jammer = 1;
-    for (to, row) in net.hears.iter_mut().enumerate() {
-        for (from, h) in row.iter_mut().enumerate() {
-            *h = to != from && !(from == jammer && to != A);
-        }
-    }
-    net.nodes[A].node.link.connect(0.0, "LA1AAA", "LA2BBB-1", &[]).unwrap();
-    net.run_until(60.0, |n| n.both_connected());
-    net.run_until(60.0, |n| n.now > 20.0 && n.nodes.iter().all(|x| x.tx.is_none()));
-    let start = net.now;
-    net.history.push((jammer, start, start + 1000.0));
-    net.nodes[A].node.link.send_data(&data(200, 120));
-    net.run_until(300.0, |n| n.has(A, &LinkEvent::Disconnected));
+    // The carrier outlasts the drop by more than the busy timeout. A Disc that late
+    // could end the peer's next session if it got the same id: drop it.
+    let (mut net, start) = jammed_live_peer(120);
     let end = net.now + net.nodes[A].node.link.busy_timeout_s(0) + 5.0;
-    net.history.retain(|&(g, ..)| g != jammer);
-    net.history.push((jammer, start, end));
+    end_jam(&mut net, start, end);
     net.run_until(400.0, |n| n.now > end + 10.0);
     assert!(!net.sent.iter().any(|&(from, .., k)| from == A && k == Kind::Disc), "stale Disc sent");
 }
