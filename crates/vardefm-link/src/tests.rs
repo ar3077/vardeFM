@@ -1264,7 +1264,7 @@ fn busy_timeout_never_drops_a_working_session() {
 }
 
 #[test]
-fn held_back_timer_restarts_only_on_our_burst_and_spares_a_burst_on_air() {
+fn held_back_timer_restarts_on_our_burst_not_a_quiet_gap_and_spares_a_burst_on_air() {
     let mut net = Net::new(70, 0.0, 0.0);
     net.nodes[A].node.link.connect(0.0, "LA1AAA", "LA2BBB-1", &[]).unwrap();
     net.run_until(60.0, |n| n.both_connected());
@@ -1429,4 +1429,26 @@ fn an_accepted_peer_burst_restarts_the_held_back_timer() {
     link.on_burst(t + 0.9 * bt, &rx);
     assert!(link.poll(t + 1.1 * bt, true).is_none());
     assert!(link.is_connected(), "dropped although B's ack came in {:.1} s ago", 0.2 * bt);
+}
+
+#[test]
+fn jam_after_an_answer_that_needs_no_reply_still_drops() {
+    // B acks A's data. Its ack needs no reply, so B waits without a retry pending. A
+    // then goes silent and the channel stays busy, and B gets data to send: the busy
+    // channel holds that data back, so B must still drop.
+    let mut net = Net::new(140, 0.0, 0.0);
+    let b = net.b();
+    net.nodes[A].node.link.connect(0.0, "LA1AAA", "LA2BBB-1", &[]).unwrap();
+    net.run_until(60.0, |n| n.both_connected());
+    net.run_until(60.0, |n| n.now > 20.0 && n.nodes.iter().all(|x| x.tx.is_none()));
+    net.nodes[A].node.link.send_data(&data(50, 140));
+    net.run_until(30.0, |n| n.nodes[b].tx.is_some());
+    assert_eq!(net.nodes[b].tx.as_ref().unwrap().2.header.ncw, 0, "expected B's ack");
+    net.run_until(30.0, |n| n.nodes[b].tx.is_none());
+    net.nodes[A].dead = true;
+    net.history.push((A, net.now - 1.0, f64::MAX));
+    net.nodes[b].node.link.send_data(&data(50, 141));
+    let limit = net.nodes[b].node.link.busy_timeout_s(0);
+    let t = net.run_until(900.0, |n| n.has(b, &LinkEvent::Disconnected));
+    assert!(t > limit && t < limit + 5.0, "took {t:.0} s, limit {limit:.0} s");
 }

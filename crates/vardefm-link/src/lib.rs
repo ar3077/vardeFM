@@ -299,6 +299,7 @@ pub struct Link {
     /// Since when something we want to send has been held back by a busy channel. Only
     /// progress restarts it: a burst of our own link going out, or one from the peer
     /// accepted. A quiet moment does not, as it may be too short for the burst to go out.
+    /// It is cleared whenever nothing waits to be sent.
     held_since: Option<f64>,
     last_tx: TxInfo,
     pub stats: LinkStats,
@@ -432,18 +433,18 @@ impl Link {
 
     /// True if there is a burst we would start ourselves as soon as the channel is quiet
     /// (or once its time comes): a connect request, a retry, data, a keepalive or a
-    /// Disc. Answers to the peer go out whether the channel is busy or not.
+    /// Disc. Answers to the peer go out whether the channel is busy or not. A wait with
+    /// no retry pending ends in `Phase::Idle`, so it holds back what `Idle` would start.
     fn wants_to_send(&self, now: f64, keepalive: f64) -> bool {
         match &self.state {
             State::Idle => false,
             State::Connecting { sending, .. } => !sending,
             State::Connected(s) => match s.phase {
                 Phase::Sending { .. } => false,
-                Phase::Wait { retry, .. } => retry,
+                Phase::Wait { retry: true, .. } => true,
                 Phase::Respond { initiated, .. } => initiated,
-                Phase::Idle => {
-                    let keepalive_due = keepalive * if s.route.caller { 1.0 } else { 1.5 };
-                    s.closing.is_some() || s.has_data() || now - s.last_heard > keepalive_due
+                Phase::Wait { retry: false, .. } | Phase::Idle => {
+                    s.closing.is_some() || s.has_data() || s.keepalive_due(now, keepalive)
                 }
             },
         }
@@ -841,7 +842,6 @@ impl Link {
                 Some(burst)
             }
             State::Connected(s) => {
-                let keepalive_due = keepalive * if s.route.caller { 1.0 } else { 1.5 };
                 // Advance timers.
                 match s.phase {
                     Phase::Sending { .. } => return None,
@@ -885,7 +885,7 @@ impl Link {
                             s.closing.is_some_and(|t| now >= t + cfg.disconnect_grace_s) && s.tx_buf.is_empty();
                         if ready_to_close {
                             s.phase = Phase::Respond { at: now, kind: Kind::Disc, initiated: true };
-                        } else if s.has_data() || now - s.last_heard > keepalive_due {
+                        } else if s.has_data() || s.keepalive_due(now, keepalive) {
                             // Start a burst on a quiet channel, after a short random wait.
                             s.phase =
                                 Phase::Respond { at: now + 0.05 + backoff * 0.5, kind: Kind::Data, initiated: true };
@@ -977,6 +977,12 @@ impl Link {
 }
 
 impl Session {
+    /// True once the peer has been quiet long enough for a keepalive (half as long
+    /// again on the called side).
+    fn keepalive_due(&self, now: f64, keepalive: f64) -> bool {
+        now - self.last_heard > keepalive * if self.route.caller { 1.0 } else { 1.5 }
+    }
+
     /// True if there are bytes the peer has not received.
     fn has_data(&self) -> bool {
         let covered: u64 = self.delivered.iter().map(|(a, b)| b - a.max(&self.tx_base)).sum();
