@@ -63,6 +63,8 @@ pub struct Ofdm {
     pre_b: Vec<Complex32>,
     /// Time-domain body (no cyclic prefix) of preamble B, unit energy.
     pre_b_body: Vec<f32>,
+    /// [`pre_b_template`] at the high-pass corner it was built for (the mode's).
+    pre_b_hp: (f32, Vec<f32>),
 }
 
 /// A demodulated frame.
@@ -120,7 +122,9 @@ impl Ofdm {
         let mut pre_b_body = sym_b[p.ncp..].to_vec();
         let e = pre_b_body.iter().map(|x| x * x).sum::<f32>().sqrt();
         pre_b_body.iter_mut().for_each(|x| *x /= e);
-        Self { p, fft, ifft, pilot_idx, data_idx, pilot_table, gains, pre_a, pre_b, pre_b_body }
+        let lo = p.detect_band_hz.0;
+        let pre_b_hp = (lo, pre_b_template(&pre_b_body, p.fs, lo));
+        Self { p, fft, ifft, pilot_idx, data_idx, pilot_table, gains, pre_a, pre_b, pre_b_body, pre_b_hp }
     }
 
     /// Leader symbols sent for a leader of at least `leader_s` seconds.
@@ -242,60 +246,53 @@ impl Ofdm {
     /// Search `rx` from `from` for a frame. Returns the sample index where the
     /// body of preamble B starts.
     pub fn detect(&self, rx: &[f32], from: usize) -> Option<usize> {
-        self.detect_band(rx, from, self.p.detect_band_hz)
-    }
-
-    /// [`detect`](Self::detect) with the detection band `band` in place of the mode's.
-    fn detect_band(&self, rx: &[f32], from: usize, (lo, hi): (f32, Option<f32>)) -> Option<usize> {
         // Filtering keeps preamble A periodic (the filter is linear and time-invariant),
         // so the autocorrelation still works on the filtered copy. See
         // `OfdmParams::detect_band_hz` for the band.
-        let mut hp = Chain::highpass8(self.p.fs, lo);
-        let hp: Vec<f32> = rx[from..].iter().map(|&x| hp.process(x)).collect();
-        let lp = hi.map(|hi| {
-            let mut lp = Chain::lowpass4(self.p.fs, hi);
-            hp.iter().map(|&x| lp.process(x)).collect::<Vec<f32>>()
-        });
-        self.detect_in(&hp, lp.as_deref().unwrap_or(&hp), &self.pre_b_template(lo), from)
+        let (lo, hi) = self.p.detect_band_hz;
+        let built;
+        let template = if lo == self.pre_b_hp.0 {
+            &self.pre_b_hp.1
+        } else {
+            built = pre_b_template(&self.pre_b_body, self.p.fs, lo);
+            &built
+        };
+        let mut band = Band::new(&rx[from.min(rx.len())..], self.p.fs, lo, hi);
+        self.detect_in(&mut band, template, from)
     }
 
-    /// The body of preamble B as it comes out of the high-pass at `lo` Hz in steady
-    /// state (preamble B is cyclic, so a few periods settle the filter), scaled to the
-    /// energy of the unfiltered body. Correlating high-passed audio against it gives
-    /// the same timing as unfiltered audio against the body: both carry the same delay.
-    fn pre_b_template(&self, lo: f32) -> Vec<f32> {
-        let n = self.p.nfft;
-        let mut f = Chain::highpass8(self.p.fs, lo);
-        let periods = 4;
-        let y: Vec<f32> = self.pre_b_body.iter().cycle().take(periods * n).map(|&x| f.process(x)).collect();
-        let mut t = y[(periods - 1) * n..].to_vec();
-        let norm = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
-        let g = norm(&self.pre_b_body) / norm(&t).max(1e-12);
-        t.iter_mut().for_each(|x| *x *= g);
-        t
-    }
-
-    /// Schmidl-Cox search over `sc` (which starts at `rx[from]`), confirmed on `hp`,
-    /// the high-passed copy of `rx[from..]`, against preamble B's `template`.
-    fn detect_in(&self, hp: &[f32], sc: &[f32], template: &[f32], from: usize) -> Option<usize> {
+    /// Schmidl-Cox search over the band-passed copy of `rx[from..]` in `band`,
+    /// confirmed on its high-passed copy against preamble B's `template`.
+    fn detect_in(&self, band: &mut Band, template: &[f32], from: usize) -> Option<usize> {
         let n = self.p.nfft;
         let h = n / 2;
         let ncp = self.p.ncp;
         let l = self.p.symbol_len();
-        if sc.len() < 3 * l {
+        let len = band.len();
+        if len < 3 * l {
             return None;
         }
-        let x = |i: usize| sc[i] as f64;
+        // The filters run only as far ahead of the search as it reads, so a search that
+        // stops early (at a burst) costs no more than the audio it has looked at.
+        let ahead = n + 2 * l + ncp + n;
+        band.fill_to(h + n);
         let mut p = 0f64;
         let mut r = 0f64;
-        for m in 0..h {
-            p += x(m) * x(m + h);
-            r += x(m + h).powi(2);
+        {
+            let x = |i: usize| band.sc()[i] as f64;
+            for m in 0..h {
+                p += x(m) * x(m + h);
+                r += x(m + h).powi(2);
+            }
         }
         let energy_floor = 1e-7 * h as f64;
         let mut plateau: Option<(usize, usize)> = None;
         let mut d = 0;
-        while d + n + 2 * l < sc.len() {
+        while d + n + 2 * l < len {
+            if band.filled() < d + ahead {
+                band.fill_to(d + ahead + 8 * l);
+            }
+            let x = |i: usize| band.sc()[i] as f64;
             let metric = if r > energy_floor && p > 0.0 { p * p / (r * r) } else { 0.0 };
             match (&mut plateau, metric > DETECT_THRESHOLD) {
                 (None, true) => plateau = Some((d, d)),
@@ -305,7 +302,7 @@ impl Ofdm {
                     plateau = None;
                     if end - start >= ncp / 4 {
                         let a0 = from + ((start + end) / 2).saturating_sub(ncp / 2);
-                        if let Some(b) = self.fine_timing(hp, template, a0 - from + l + ncp) {
+                        if let Some(b) = self.fine_timing(band.hp(), template, a0 - from + l + ncp) {
                             return Some(from + b);
                         }
                     }
@@ -483,6 +480,76 @@ impl Ofdm {
     }
 }
 
+/// The body of preamble B (`body`) as it comes out of the high-pass at `lo` Hz in
+/// steady state (preamble B is cyclic, so a few periods settle the filter), scaled to
+/// the energy of the unfiltered body. Correlating high-passed audio against it gives
+/// the same timing as unfiltered audio against the body: both carry the same delay.
+fn pre_b_template(body: &[f32], fs: f32, lo: f32) -> Vec<f32> {
+    let n = body.len();
+    let mut f = Chain::highpass8(fs, lo);
+    let periods = 4;
+    let y: Vec<f32> = body.iter().cycle().take(periods * n).map(|&x| f.process(x)).collect();
+    let mut t = y[(periods - 1) * n..].to_vec();
+    let norm = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let g = norm(body) / norm(&t).max(1e-12);
+    t.iter_mut().for_each(|x| *x *= g);
+    t
+}
+
+/// The detection band of `src`, filtered on demand: `hp` is the high-passed copy and
+/// `lp` (when the band has an upper edge) the high- then low-passed copy, each
+/// covering `src[..filled]`. Filtering sample by sample from the start gives the same
+/// values as filtering all of `src` at once.
+struct Band<'a> {
+    src: &'a [f32],
+    hp_f: Chain,
+    lp_f: Option<Chain>,
+    hp: Vec<f32>,
+    lp: Vec<f32>,
+}
+
+impl<'a> Band<'a> {
+    fn new(src: &'a [f32], fs: f32, lo: f32, hi: Option<f32>) -> Self {
+        let lp_f = hi.map(|hi| Chain::lowpass4(fs, hi));
+        Self { src, hp_f: Chain::highpass8(fs, lo), lp_f, hp: Vec::new(), lp: Vec::new() }
+    }
+
+    fn len(&self) -> usize {
+        self.src.len()
+    }
+
+    fn filled(&self) -> usize {
+        self.hp.len()
+    }
+
+    /// Filter on to `end` samples, or to the end of `src`.
+    fn fill_to(&mut self, end: usize) {
+        let end = end.min(self.src.len());
+        for &x in &self.src[self.hp.len().min(end)..end] {
+            let y = self.hp_f.process(x);
+            self.hp.push(y);
+            if let Some(lp) = &mut self.lp_f {
+                self.lp.push(lp.process(y));
+            }
+        }
+    }
+
+    /// The high-passed copy, for the preamble B confirmation.
+    fn hp(&self) -> &[f32] {
+        &self.hp
+    }
+
+    /// The copy the Schmidl-Cox search runs on: band-passed when the band has an upper
+    /// edge, else high-passed.
+    fn sc(&self) -> &[f32] {
+        if self.lp_f.is_some() {
+            &self.lp
+        } else {
+            &self.hp
+        }
+    }
+}
+
 /// Split the linear phase (the timing offset) off a per-carrier channel estimate.
 /// Returns the slope in radians per carrier and the estimate without it.
 fn remove_slope(raw: &[Complex32]) -> (f32, Vec<Complex32>) {
@@ -640,6 +707,45 @@ mod tests {
             }
         }
         assert!(missed.is_empty(), "{missed:#?}");
+    }
+
+    /// `detect` filters only as far as its search reads. On a recording with several
+    /// bursts, a CTCSS tone and noise, it finds what a search over the whole recording
+    /// filtered up front finds, from every start, and the stored template is the one
+    /// built for the mode's band.
+    #[test]
+    fn lazy_detection_filtering_matches_filtering_everything() {
+        for p in [OfdmParams::narrow(), OfdmParams::wide()] {
+            let ofdm = Ofdm::new(p);
+            let (lo, hi) = ofdm.p.detect_band_hz;
+            assert_eq!(ofdm.pre_b_hp.1, pre_b_template(&ofdm.pre_b_body, ofdm.p.fs, lo));
+            let mut rng = Prng::new(7);
+            let mut rx = vec![0.0; 1500];
+            for seed in 0..3 {
+                rx.extend(ofdm.modulate_with_leader(&random_frame(&ofdm, Modulation::Qpsk, 4, seed), 0.1));
+                rx.extend(vec![0.0; 3000 + 700 * seed as usize]);
+            }
+            let w = 2.0 * std::f32::consts::PI * 100.0 / ofdm.p.fs;
+            let rx: Vec<f32> =
+                rx.iter().enumerate().map(|(i, v)| v + 0.3 * (w * i as f32).sin() + 0.01 * rng.bpsk()).collect();
+            let eager = |from: usize| {
+                let mut band = Band::new(&rx[from..], ofdm.p.fs, lo, hi);
+                band.fill_to(rx.len());
+                ofdm.detect_in(&mut band, &ofdm.pre_b_hp.1, from)
+            };
+            let mut found = 0;
+            let mut from = 0;
+            while let Some(b) = eager(from) {
+                assert_eq!(ofdm.detect(&rx, from), Some(b), "{} from {from}", ofdm.p.name);
+                found += 1;
+                from = b + 1;
+            }
+            assert_eq!(ofdm.detect(&rx, from), None, "{} from {from}", ofdm.p.name);
+            assert_eq!(found, 3, "{}", ofdm.p.name);
+            for from in (0..rx.len()).step_by(997) {
+                assert_eq!(ofdm.detect(&rx, from), eager(from), "{} from {from}", ofdm.p.name);
+            }
+        }
     }
 
     fn random_frame(ofdm: &Ofdm, m: Modulation, nsym: usize, seed: u32) -> Vec<Vec<Complex32>> {
