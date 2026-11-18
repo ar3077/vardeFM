@@ -216,8 +216,9 @@ and checked by the `fer_gate` test. That file is the reference; roughly, the poi
 - **Connect:** the caller sends `ConnectReq` (level 0, one codeword) with payload
   `"VFM1" | len | source call | len | destination call`, zero padded, and a random
   non-zero session id. The caller avoids ids it has heard in any burst in the last 10
-  minutes (any id if it has heard all of them), so it does not share an id with a
-  session on the channel. Through digipeaters the payload is
+  minutes, or three keepalive intervals if that is longer (any id if it has heard all of
+  them), so it does not share an id with a session it can hear. A session it cannot hear
+  may still share its id. Through digipeaters the payload is
   `"VFM2" | len | source | len | destination | count | (len | digipeater) × count`
   (section 3.4). A station that has `LISTEN ON` and the destination among its
   `MYCALL`s answers `ConnectAck` with the same payload and session id. The caller retries

@@ -72,10 +72,6 @@ const SEGMENT_HEADER: usize = 4;
 const RETRY_BACKOFF_S: f64 = 0.4;
 /// Largest random addition to the wait between connect requests.
 const CONNECT_JITTER_S: f64 = 0.5;
-/// A caller does not pick a session id it has heard in this many seconds, so it does not
-/// share an id with a session on the channel (issue #27). The same time a digipeater keeps
-/// an idle session.
-const HEARD_ID_S: f64 = 600.0;
 /// Largest `hop_margin_s`. A digipeater does not know the end stations' margin, so the
 /// lifetimes of its sessions are sized for this one.
 pub const MAX_HOP_MARGIN_S: f64 = 10.0;
@@ -429,10 +425,18 @@ impl Link {
         Ok(())
     }
 
-    /// A random non-zero session id not heard in the last [`HEARD_ID_S`]. If every id
-    /// has been heard, any non-zero id.
+    /// How long a caller avoids a session id after hearing it, so it does not share an id
+    /// with a session it can hear (issue #27): as long as a digipeater keeps an idle
+    /// session, and three keepalive intervals, so a quiet session's id is not freed.
+    fn heard_id_s(&self) -> f64 {
+        digi::IDLE_EXPIRY_S.max(3.0 * self.cfg.keepalive_s)
+    }
+
+    /// A random non-zero session id not heard in the last [`Self::heard_id_s`]. If every
+    /// id has been heard, any non-zero id.
     fn pick_session_id(&mut self, now: f64) -> u8 {
-        let free: Vec<u8> = (1..=255).filter(|&id| now - self.heard_ids[id as usize] > HEARD_ID_S).collect();
+        let keep = self.heard_id_s();
+        let free: Vec<u8> = (1..=255).filter(|&id| now - self.heard_ids[id as usize] > keep).collect();
         let n = self.rng.next_u32();
         if free.is_empty() {
             (n % 255 + 1) as u8

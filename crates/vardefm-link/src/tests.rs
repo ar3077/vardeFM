@@ -1201,24 +1201,25 @@ fn connecting_caller_ignores_another_sessions_data() {
 #[test]
 fn caller_does_not_pick_a_session_id_heard_recently() {
     let modem = Arc::new(Modem::new(OfdmParams::narrow(), 0.1));
+    let keep = Link::new(modem.clone(), LinkConfig::default(), 0).heard_id_s();
     // Every id but 77 heard at t = 100: each caller picks 77.
     for seed in 0..20 {
         let mut c = Link::new(modem.clone(), LinkConfig::default(), seed);
         for id in (1..=255).filter(|&id| id != 77) {
             c.on_burst(100.0, &probe(id, false, 0));
         }
-        c.connect(100.0 + HEARD_ID_S - 1.0, "LA5CCC", "LA9ZZZ", &[]).unwrap();
+        c.connect(100.0 + keep - 1.0, "LA5CCC", "LA9ZZZ", &[]).unwrap();
         let State::Connecting { session, .. } = &c.state else { panic!("not connecting") };
         assert_eq!(*session, 77, "seed {seed}");
     }
-    // Once HEARD_ID_S has passed, the ids are free again.
+    // Once that time has passed, the ids are free again.
     let picked: std::collections::HashSet<u8> = (0..20)
         .map(|seed| {
             let mut c = Link::new(modem.clone(), LinkConfig::default(), seed);
             for id in (1..=255).filter(|&id| id != 77) {
                 c.on_burst(100.0, &probe(id, false, 0));
             }
-            c.connect(100.0 + HEARD_ID_S + 1.0, "LA5CCC", "LA9ZZZ", &[]).unwrap();
+            c.connect(100.0 + keep + 1.0, "LA5CCC", "LA9ZZZ", &[]).unwrap();
             let State::Connecting { session, .. } = &c.state else { panic!("not connecting") };
             *session
         })
