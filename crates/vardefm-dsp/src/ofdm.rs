@@ -246,6 +246,12 @@ impl Ofdm {
     /// Search `rx` from `from` for a frame. Returns the sample index where the
     /// body of preamble B starts.
     pub fn detect(&self, rx: &[f32], from: usize) -> Option<usize> {
+        self.detect_chunked(rx, from, 8 * self.p.symbol_len())
+    }
+
+    /// [`detect`](Self::detect), filtering `chunk` samples past what the search needs
+    /// each time it runs out (fewer, larger steps; the result does not depend on it).
+    fn detect_chunked(&self, rx: &[f32], from: usize, chunk: usize) -> Option<usize> {
         // Filtering keeps preamble A periodic (the filter is linear and time-invariant),
         // so the autocorrelation still works on the filtered copy. See
         // `OfdmParams::detect_band_hz` for the band.
@@ -258,12 +264,16 @@ impl Ofdm {
             &built
         };
         let mut band = Band::new(&rx[from.min(rx.len())..], self.p.fs, lo, hi);
-        self.detect_in(&mut band, template, from)
+        self.detect_in(&mut band, template, from, chunk)
     }
 
     /// Schmidl-Cox search over the band-passed copy of `rx[from..]` in `band`,
     /// confirmed on its high-passed copy against preamble B's `template`.
-    fn detect_in(&self, band: &mut Band, template: &[f32], from: usize) -> Option<usize> {
+    ///
+    /// The filters run only as far as the search reads (plus `chunk`), so a search that
+    /// stops early (at a burst) costs no more than the audio it has looked at. Each
+    /// read is preceded by a fill to the sample it needs.
+    fn detect_in(&self, band: &mut Band, template: &[f32], from: usize, chunk: usize) -> Option<usize> {
         let n = self.p.nfft;
         let h = n / 2;
         let ncp = self.p.ncp;
@@ -272,10 +282,7 @@ impl Ofdm {
         if len < 3 * l {
             return None;
         }
-        // The filters run only as far ahead of the search as it reads, so a search that
-        // stops early (at a burst) costs no more than the audio it has looked at.
-        let ahead = n + 2 * l + ncp + n;
-        band.fill_to(h + n);
+        band.fill_to(n);
         let mut p = 0f64;
         let mut r = 0f64;
         {
@@ -289,10 +296,10 @@ impl Ofdm {
         let mut plateau: Option<(usize, usize)> = None;
         let mut d = 0;
         while d + n + 2 * l < len {
-            if band.filled() < d + ahead {
-                band.fill_to(d + ahead + 8 * l);
+            // The update below reads up to `d + n`.
+            if band.filled() <= d + n {
+                band.fill_to(d + n + 1 + chunk);
             }
-            let x = |i: usize| band.sc()[i] as f64;
             let metric = if r > energy_floor && p > 0.0 { p * p / (r * r) } else { 0.0 };
             match (&mut plateau, metric > DETECT_THRESHOLD) {
                 (None, true) => plateau = Some((d, d)),
@@ -302,13 +309,17 @@ impl Ofdm {
                     plateau = None;
                     if end - start >= ncp / 4 {
                         let a0 = from + ((start + end) / 2).saturating_sub(ncp / 2);
-                        if let Some(b) = self.fine_timing(band.hp(), template, a0 - from + l + ncp) {
+                        let expected = a0 - from + l + ncp;
+                        // `fine_timing` reads up to `expected + ncp + n`.
+                        band.fill_to(expected + ncp + n);
+                        if let Some(b) = self.fine_timing(band.hp(), template, expected) {
                             return Some(from + b);
                         }
                     }
                 }
                 (None, false) => {}
             }
+            let x = |i: usize| band.sc()[i] as f64;
             p += x(d + h) * x(d + n) - x(d) * x(d + h);
             r += x(d + n).powi(2) - x(d + h).powi(2);
             d += 1;
@@ -499,7 +510,8 @@ fn pre_b_template(body: &[f32], fs: f32, lo: f32) -> Vec<f32> {
 /// The detection band of `src`, filtered on demand: `hp` is the high-passed copy and
 /// `lp` (when the band has an upper edge) the high- then low-passed copy, each
 /// covering `src[..filled]`. Filtering sample by sample from the start gives the same
-/// values as filtering all of `src` at once.
+/// values as filtering all of `src` at once. A NaN or infinite sample goes in as 0, so
+/// it cannot leave the filters' state NaN and hide every burst after it.
 struct Band<'a> {
     src: &'a [f32],
     hp_f: Chain,
@@ -526,7 +538,7 @@ impl<'a> Band<'a> {
     fn fill_to(&mut self, end: usize) {
         let end = end.min(self.src.len());
         for &x in &self.src[self.hp.len().min(end)..end] {
-            let y = self.hp_f.process(x);
+            let y = self.hp_f.process(if x.is_finite() { x } else { 0.0 });
             self.hp.push(y);
             if let Some(lp) = &mut self.lp_f {
                 self.lp.push(lp.process(y));
@@ -700,7 +712,8 @@ mod tests {
                     let w = 2.0 * std::f32::consts::PI * f / ofdm.p.fs;
                     let x: Vec<f32> = rx.iter().enumerate().map(|(i, v)| v + a * (w * i as f32 + ph).sin()).collect();
                     let got = ofdm.detect(&x, 0);
-                    if got != Some(truth) {
+                    // As `detector_eval` counts a hit: within a quarter cyclic prefix.
+                    if !got.is_some_and(|b| b.abs_diff(truth) <= ofdm.p.ncp / 4) {
                         missed.push(format!("{} {f} Hz phase {ph}: {got:?}, want {truth}", ofdm.p.name));
                     }
                 }
@@ -711,8 +724,10 @@ mod tests {
 
     /// `detect` filters only as far as its search reads. On a recording with several
     /// bursts, a CTCSS tone and noise, it finds what a search over the whole recording
-    /// filtered up front finds, from every start, and the stored template is the one
-    /// built for the mode's band.
+    /// filtered up front finds, from the start, from just past each burst and from
+    /// starts spread over the recording, with the default fill step and with none (each
+    /// fill exactly to the sample read next). The stored template is the one built for
+    /// the mode's band.
     #[test]
     fn lazy_detection_filtering_matches_filtering_everything() {
         for p in [OfdmParams::narrow(), OfdmParams::wide()] {
@@ -731,19 +746,47 @@ mod tests {
             let eager = |from: usize| {
                 let mut band = Band::new(&rx[from..], ofdm.p.fs, lo, hi);
                 band.fill_to(rx.len());
-                ofdm.detect_in(&mut band, &ofdm.pre_b_hp.1, from)
+                ofdm.detect_in(&mut band, &ofdm.pre_b_hp.1, from, 0)
+            };
+            let lazy = |from: usize| {
+                let got = ofdm.detect(&rx, from);
+                assert_eq!(ofdm.detect_chunked(&rx, from, 0), got, "{} from {from}, no fill step", ofdm.p.name);
+                got
             };
             let mut found = 0;
             let mut from = 0;
             while let Some(b) = eager(from) {
-                assert_eq!(ofdm.detect(&rx, from), Some(b), "{} from {from}", ofdm.p.name);
+                assert_eq!(lazy(from), Some(b), "{} from {from}", ofdm.p.name);
                 found += 1;
                 from = b + 1;
             }
-            assert_eq!(ofdm.detect(&rx, from), None, "{} from {from}", ofdm.p.name);
+            assert_eq!(lazy(from), None, "{} from {from}", ofdm.p.name);
             assert_eq!(found, 3, "{}", ofdm.p.name);
             for from in (0..rx.len()).step_by(997) {
-                assert_eq!(ofdm.detect(&rx, from), eager(from), "{} from {from}", ofdm.p.name);
+                assert_eq!(lazy(from), eager(from), "{} from {from}", ofdm.p.name);
+            }
+        }
+    }
+
+    /// A NaN or an infinite sample before a frame, or a long run of exact silence,
+    /// does not leave detection's filters stuck: the frame after it is still found
+    /// where it is found without them, and silence alone finds nothing.
+    #[test]
+    fn detection_recovers_from_nan_inf_and_silence() {
+        for p in [OfdmParams::narrow(), OfdmParams::wide()] {
+            let ofdm = Ofdm::new(p);
+            let tol = ofdm.p.ncp / 4;
+            let silence = vec![0.0; 10 * ofdm.p.fs as usize];
+            assert_eq!(ofdm.detect(&silence, 0), None, "{}", ofdm.p.name);
+            let mut rx = silence.clone();
+            rx.extend(ofdm.modulate_with_leader(&random_frame(&ofdm, Modulation::Qpsk, 4, 3), 0.1));
+            rx.extend(vec![0.0; 2000]);
+            let truth = ofdm.detect(&rx, 0).expect("frame not detected");
+            for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                let mut x = rx.clone();
+                x[1000..1010].fill(bad);
+                let got = ofdm.detect(&x, 0);
+                assert!(got.is_some_and(|b| b.abs_diff(truth) <= tol), "{} {bad}: {got:?}, want {truth}", ofdm.p.name);
             }
         }
     }

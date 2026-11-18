@@ -38,19 +38,21 @@
 //! A detection there costs a header decode; a decoded header there is a false burst.
 //!
 //! A CTCSS pass counts decoded bursts with a sub-tone on the carrier: every EIA tone at
-//! 375, 750 and 1500 Hz deviation (the tables `busy_eval` uses), at one CNR, on each
+//! 375, 750 and 1500 Hz deviation (the tables `busy_eval` uses), at each CTCSS CNR, on each
 //! receive path that can hear one ([`ctcss_cases`]), after a row without a tone. The
 //! simulated radio adds the tone at its modulator, after the deviation limiter. Each
 //! cell has a genie column too: where it decodes and a detector does not, detection
 //! lost the burst; where neither does, the tone broke demodulation. A tone once made
-//! Schmidl-Cox miss every burst for many tones (#12). At level 1 nothing is lost now;
-//! at the quieter, denser levels 5 and 6 the tone still breaks demodulation.
+//! Schmidl-Cox miss every burst for many tones (#12). At level 1 and 20 dB CNR nothing
+//! is lost now. At the knee, detection keeps its no-tone share of the genie's bursts.
+//! The tone still breaks demodulation: at the quieter, denser levels 5 and 6, and at
+//! the knee on narrow de-emphasised audio at 1500 Hz deviation.
 //!
 //! `cargo test --release -p vardefm-modem detector_eval -- --ignored --nocapture`
 //!
 //! Environment: `MODES` (narrow,wide), `TRIALS` per CNR (100), `LEVEL` (1), `NCW` (1),
 //! `CNRS` (dB list, default per mode), `NOISE_SECONDS` per noise case (60),
-//! `CTCSS_TRIALS` per tone and deviation (10; 0 skips the pass), `CTCSS_CNR` (20 dB),
+//! `CTCSS_TRIALS` per tone and deviation (10; 0 skips the pass), `CTCSS_CNRS` (dB list: 5,20 narrow, 7,20 wide: the knee and well above it),
 //! `CSV` (file to append the burst results to).
 
 use super::*;
@@ -469,8 +471,7 @@ fn noise_case(mode: &str, case: usize, seconds: f32, fs: f32) -> Vec<f32> {
 fn ctcss_pass(m: &Modem, mode: &str, case: &CtcssCase, cnr: f32, level: u8, ncw: usize, trials: u32) {
     let base = ctcss_channel(&FmChannelConfig::by_name(mode).unwrap(), case);
     let clean = FmChannelConfig { cnr_db: None, ..base.clone() };
-    let truth = m.ofdm.detect(&transmit(&clean, &m.modulate(&burst(level, ncw, payload_seed(0)))), 0);
-    let truth = truth.expect("burst not found on a clean channel");
+    let truth = clean_position(m, &transmit(&clean, &m.modulate(&burst(level, ncw, payload_seed(0)))));
     let names: Vec<&str> = DETECTORS.iter().map(|(n, _)| *n).chain(["genie"]).collect();
     println!(
         "{mode}, {}: decoded bursts out of {trials} with a CTCSS tone, CNR {cnr} dB, at {CTCSS_DEVIATION_HZ:?} Hz \
@@ -545,7 +546,6 @@ fn detector_eval() {
     let ncw: usize = env_or("NCW", 1);
     let noise_s: f32 = env_or("NOISE_SECONDS", 60.0);
     let ctcss_trials: u32 = env_or("CTCSS_TRIALS", 10);
-    let ctcss_cnr: f32 = env_or("CTCSS_CNR", 20.0);
     assert!((level as usize) < LEVELS.len(), "LEVEL {level}: levels are 0 to {}", LEVELS.len() - 1);
     assert!(trials > 0, "TRIALS must be at least 1");
     assert!(noise_s > 0.0 && noise_s.is_finite(), "NOISE_SECONDS={noise_s}: must be a finite number more than 0");
@@ -571,8 +571,19 @@ fn detector_eval() {
         }
         cnrs
     };
+    // At the sensitivity knee, where a tone that cost a dB or two would show, and well
+    // above it.
+    let ctcss_cnr_list = |mode: &str| -> Vec<f32> {
+        let default = if mode == "narrow" { "5,20" } else { "7,20" };
+        let cnrs: Vec<f32> = env_list("CTCSS_CNRS", default);
+        for c in &cnrs {
+            assert!(c.is_finite(), "CTCSS_CNRS: {c} is not a finite number of dB");
+        }
+        cnrs
+    };
     for mode in &modes {
         cnr_list(mode);
+        ctcss_cnr_list(mode);
     }
     // Any path the OS accepts, Unicode or not.
     let mut csv = std::env::var_os("CSV").map(|p| {
@@ -628,8 +639,10 @@ fn detector_eval() {
             println!("{line}");
         }
         if ctcss_trials > 0 {
-            for case in ctcss_cases(mode) {
-                ctcss_pass(&m, mode, case, ctcss_cnr, level, ncw, ctcss_trials);
+            for cnr in ctcss_cnr_list(mode) {
+                for case in ctcss_cases(mode) {
+                    ctcss_pass(&m, mode, case, cnr, level, ncw, ctcss_trials);
+                }
             }
         }
         println!("{mode}: per minute of audio without a burst, detections / decoded headers");

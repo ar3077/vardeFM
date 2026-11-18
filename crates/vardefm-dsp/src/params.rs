@@ -35,9 +35,13 @@ pub struct OfdmParams {
     /// part, to its correlation term, depending on the tone, so a strong one either
     /// holds the metric below threshold or stretches the plateau into the leader; it
     /// also swells the energy that preamble B is confirmed against. The corner sits as
-    /// high as preamble A's lowest carrier allows (375 Hz wide, 469 Hz narrow): high
-    /// enough that, in `detector_eval`, every tone at up to 1500 Hz deviation (twice the
-    /// usual) leaves detection as good as without a tone. In narrow mode the higher
+    /// high as preamble A's lowest carrier allows (375 Hz wide, 469 Hz narrow). In
+    /// `detector_eval`'s CTCSS pass (level 1), detection then decodes every burst the
+    /// genie does at 20 dB CNR, for every tone at up to 1500 Hz deviation (twice the
+    /// usual). At the sensitivity knee (5 dB narrow, 7 dB wide) it keeps the share of
+    /// genie bursts it has without a tone. The exception is narrow de-emphasised audio
+    /// at 1500 Hz deviation, where the tone costs the genie bursts too (demodulation,
+    /// #18). In narrow mode the higher
     /// corner also removes de-emphasised noise and detects weak bursts better.
     ///
     /// The low-pass is for the flat data port, where FM noise rises with frequency, so
