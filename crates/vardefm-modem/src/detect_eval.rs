@@ -58,12 +58,13 @@
 //! `CSV` (file to append the burst results to).
 
 use super::*;
-use crate::busy_eval::{CTCSS_DEVIATION_HZ, CTCSS_HZ};
+use crate::busy_eval::CTCSS_DEVIATION_HZ;
 use std::collections::HashMap;
 use std::f32::consts::PI;
 use std::io::Write;
 use std::sync::Arc;
 use vardefm_dsp::prng::Prng;
+use vardefm_dsp::CTCSS_HZ;
 use vardefm_sim::{transmit, Ctcss, FmChannelConfig};
 
 pub(crate) use crate::receiver::DetectFn;
@@ -201,9 +202,9 @@ pub(crate) enum CtcssTap {
     /// Through the channel: the radio's tone encoder adds it at the modulator, and the
     /// receive chain (de-emphasis, audio band) treats it as it treats the burst.
     Channel,
-    /// Added flat at its deviation to the received audio, as at a discriminator tap
-    /// that bypasses de-emphasis and the audio filter. The burst still takes the
-    /// channel's receive chain.
+    /// Added flat at its deviation to the received audio while the carrier is up and
+    /// the squelch open, as at a discriminator tap that bypasses de-emphasis and the
+    /// audio filter. The burst still takes the channel's receive chain.
     Discriminator,
 }
 
@@ -251,16 +252,39 @@ pub(crate) fn with_ctcss(
     ph: f32,
 ) -> Vec<f32> {
     let tx = m.modulate(sent);
+    let toneless = (tap == CtcssTap::Discriminator).then(|| transmit(cfg, &tx));
+    with_ctcss_on(cfg, tap, &tx, toneless.as_deref(), f, dev, ph)
+}
+
+/// [`with_ctcss`] for the modulated burst `tx`. A discriminator tap adds the tone to
+/// `toneless`, what the channel gives without one, so a caller trying several tones on
+/// one trial runs the channel once; the channel tap ignores it.
+fn with_ctcss_on(
+    cfg: &FmChannelConfig,
+    tap: CtcssTap,
+    tx: &[f32],
+    toneless: Option<&[f32]>,
+    f: f32,
+    dev: f32,
+    ph: f32,
+) -> Vec<f32> {
     match tap {
         CtcssTap::Channel => {
             let ctcss = (dev > 0.0).then_some(Ctcss { hz: f, deviation_hz: dev, phase: ph });
-            transmit(&FmChannelConfig { ctcss, ..cfg.clone() }, &tx)
+            transmit(&FmChannelConfig { ctcss, ..cfg.clone() }, tx)
         }
         CtcssTap::Discriminator => {
-            let mut rx = transmit(cfg, &tx);
+            let mut rx = toneless.expect("a discriminator tap needs the toneless channel output").to_vec();
+            assert_eq!(cfg.clock_offset_ppm, 0.0, "the tone span assumes no clock offset");
+            // The tone starts at phase `ph` at carrier up, as `transmit` starts it, and
+            // is heard while the carrier is up and the squelch open.
+            let lead = (cfg.lead_silence_s * cfg.fs) as usize;
+            let open = lead + (cfg.keyup_delay_s * cfg.fs) as usize..(lead + tx.len()).min(rx.len());
             let a = (dev / cfg.deviation_hz) as f64;
-            let w = 2.0 * std::f64::consts::PI * f as f64 / m.fs() as f64;
-            rx.iter_mut().enumerate().for_each(|(i, v)| *v += (a * (w * i as f64 + ph as f64).sin()) as f32);
+            let w = 2.0 * std::f64::consts::PI * f as f64 / cfg.fs as f64;
+            for i in open {
+                rx[i] += (a * (w * (i - lead) as f64 + ph as f64).sin()) as f32;
+            }
             rx
         }
     }
@@ -480,23 +504,39 @@ fn ctcss_pass(m: &Modem, mode: &str, case: &CtcssCase, cnr: f32, level: u8, ncw:
          deviation",
         case.name
     );
-    // Per row and deviation, per detector then the genie.
-    let row = |f: f32, devs: &[f32]| -> Vec<Vec<u32>> {
-        let res = on_every_core(devs.len() as u32 * trials, |k| {
-            let (dev, t) = (devs[(k / trials) as usize], k % trials);
-            let sent = burst(level, ncw, payload_seed(t));
-            let cfg = FmChannelConfig { cnr_db: Some(cnr), seed: channel_seed(cnr, t), ..base.clone() };
-            let rx = with_ctcss(m, &cfg, case.tap, &sent, f, dev, 0.7 * t as f32);
-            let mut cache = Decodes::new();
-            let genie = decode_at(m, &rx, truth, &sent, &mut cache) == Some(true);
-            DETECTORS
-                .iter()
-                .map(|(_, d)| receive(m, *d, &rx, &sent, &mut cache).ok)
-                .chain([genie])
-                .collect::<Vec<bool>>()
-        });
+    // The cells: no tone, then every tone at every deviation.
+    let cells: Vec<(f32, f32)> = std::iter::once((0.0, 0.0))
+        .chain(CTCSS_HZ.iter().flat_map(|&f| CTCSS_DEVIATION_HZ.iter().map(move |&dev| (f, dev))))
+        .collect();
+    // Per trial, per cell, per detector then the genie. A trial modulates its burst
+    // once, and on a discriminator tap runs the channel once for all its cells.
+    let res = on_every_core(trials, |t| {
+        let sent = burst(level, ncw, payload_seed(t));
+        let cfg = FmChannelConfig { cnr_db: Some(cnr), seed: channel_seed(cnr, t), ..base.clone() };
+        let tx = m.modulate(&sent);
+        let toneless = transmit(&cfg, &tx);
+        cells
+            .iter()
+            .map(|&(f, dev)| {
+                let rx = if dev == 0.0 {
+                    toneless.clone()
+                } else {
+                    with_ctcss_on(&cfg, case.tap, &tx, Some(&toneless), f, dev, 0.7 * t as f32)
+                };
+                let mut cache = Decodes::new();
+                let genie = decode_at(m, &rx, truth, &sent, &mut cache) == Some(true);
+                DETECTORS
+                    .iter()
+                    .map(|(_, d)| receive(m, *d, &rx, &sent, &mut cache).ok)
+                    .chain([genie])
+                    .collect::<Vec<bool>>()
+            })
+            .collect::<Vec<_>>()
+    });
+    // Per detector then the genie, per deviation, for the cells `first..` of one row.
+    let row = |first: usize, devs: usize| -> Vec<Vec<u32>> {
         (0..names.len())
-            .map(|d| res.chunks(trials as usize).map(|c| c.iter().filter(|r| r[d]).count() as u32).collect())
+            .map(|d| (first..first + devs).map(|c| res.iter().filter(|r| r[c][d]).count() as u32).collect())
             .collect()
     };
     let print = |label: String, counts: &[Vec<u32>]| {
@@ -507,10 +547,10 @@ fn ctcss_pass(m: &Modem, mode: &str, case: &CtcssCase, cnr: f32, level: u8, ncw:
         }
         println!("{line}");
     };
-    print("no tone".into(), &row(0.0, &[0.0]));
+    print("no tone".into(), &row(0, 1));
     let mut total = vec![vec![0u32; CTCSS_DEVIATION_HZ.len()]; names.len()];
-    for f in CTCSS_HZ {
-        let counts = row(f, &CTCSS_DEVIATION_HZ);
+    for (i, f) in CTCSS_HZ.into_iter().enumerate() {
+        let counts = row(1 + i * CTCSS_DEVIATION_HZ.len(), CTCSS_DEVIATION_HZ.len());
         for (t, c) in total.iter_mut().zip(&counts) {
             t.iter_mut().zip(c).for_each(|(t, c)| *t += c);
         }

@@ -61,10 +61,8 @@ pub struct Ofdm {
     gains: Vec<f32>,
     pre_a: Vec<Complex32>,
     pre_b: Vec<Complex32>,
-    /// Time-domain body (no cyclic prefix) of preamble B, unit energy.
-    pre_b_body: Vec<f32>,
-    /// [`pre_b_template`] at the high-pass corner it was built for (the mode's).
-    pre_b_hp: (f32, Vec<f32>),
+    /// [`pre_b_template`] of preamble B's body at the mode's high-pass corner.
+    pre_b_hp: Vec<f32>,
 }
 
 /// A demodulated frame.
@@ -119,12 +117,12 @@ impl Ofdm {
         let pre_b: Vec<Complex32> = (0..nc).map(|_| Complex32::new(rng.bpsk(), 0.0)).collect();
 
         let sym_b = symbol_time(&p, &gains, ifft.as_ref(), &pre_b);
+        // Time-domain body (no cyclic prefix) of preamble B, unit energy.
         let mut pre_b_body = sym_b[p.ncp..].to_vec();
         let e = pre_b_body.iter().map(|x| x * x).sum::<f32>().sqrt();
         pre_b_body.iter_mut().for_each(|x| *x /= e);
-        let lo = p.detect_band_hz.0;
-        let pre_b_hp = (lo, pre_b_template(&pre_b_body, p.fs, lo));
-        Self { p, fft, ifft, pilot_idx, data_idx, pilot_table, gains, pre_a, pre_b, pre_b_body, pre_b_hp }
+        let pre_b_hp = pre_b_template(&pre_b_body, p.fs, p.detect_band_hz.0);
+        Self { p, fft, ifft, pilot_idx, data_idx, pilot_table, gains, pre_a, pre_b, pre_b_hp }
     }
 
     /// Leader symbols sent for a leader of at least `leader_s` seconds.
@@ -262,15 +260,8 @@ impl Ofdm {
         // so the autocorrelation still works on the filtered copy. See
         // `OfdmParams::detect_band_hz` for the band.
         let (lo, hi) = self.p.detect_band_hz;
-        let built;
-        let template = if lo == self.pre_b_hp.0 {
-            &self.pre_b_hp.1
-        } else {
-            built = pre_b_template(&self.pre_b_body, self.p.fs, lo);
-            &built
-        };
         let mut band = Band::new(rx, from, self.p.fs, lo, hi);
-        self.detect_in(&mut band, template, from, chunk)
+        self.detect_in(&mut band, &self.pre_b_hp, from, chunk)
     }
 
     /// Schmidl-Cox search over the band-passed copy of `rx[from..]` in `band`,
@@ -694,11 +685,7 @@ fn noise_model(dev: &[Vec<f32>]) -> (Vec<f32>, Vec<f32>) {
 mod tests {
     use super::*;
     use crate::qam::Modulation;
-
-    const CTCSS_HZ: [f32; 21] = [
-        67.0, 71.9, 77.0, 82.5, 88.5, 94.8, 100.0, 107.2, 114.8, 123.0, 131.8, 141.3, 151.4, 162.2, 173.8, 186.2,
-        203.5, 218.1, 233.6, 250.3, 254.1,
-    ];
+    use crate::CTCSS_HZ;
 
     fn roundtrip(p: OfdmParams, m: Modulation, lead: usize) {
         let ofdm = Ofdm::new(p);
@@ -838,14 +825,12 @@ mod tests {
     /// bursts, a CTCSS tone and noise, it finds what a search over the whole recording
     /// filtered up front finds, from the start, from just past each burst and from
     /// starts spread over the recording, with the default fill step and with none (each
-    /// fill exactly to the sample read next). The stored template is the one built for
-    /// the mode's band.
+    /// fill exactly to the sample read next).
     #[test]
     fn lazy_detection_filtering_matches_filtering_everything() {
         for p in [OfdmParams::narrow(), OfdmParams::wide()] {
             let ofdm = Ofdm::new(p);
             let (lo, hi) = ofdm.p.detect_band_hz;
-            assert_eq!(ofdm.pre_b_hp.1, pre_b_template(&ofdm.pre_b_body, ofdm.p.fs, lo));
             let mut rng = Prng::new(7);
             let mut rx = vec![0.0; 1500];
             for seed in 0..3 {
@@ -858,7 +843,7 @@ mod tests {
             let eager = |from: usize| {
                 let mut band = Band::new(&rx, from, ofdm.p.fs, lo, hi);
                 band.fill_to(rx.len());
-                ofdm.detect_in(&mut band, &ofdm.pre_b_hp.1, from, 0)
+                ofdm.detect_in(&mut band, &ofdm.pre_b_hp, from, 0)
             };
             let lazy = |from: usize| {
                 let got = ofdm.detect(&rx, from);

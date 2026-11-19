@@ -12,6 +12,12 @@ pub use num_complex::Complex32;
 /// a finite sample overflows the high-Q sections of an IIR filter and leaves its state
 /// NaN, so the filters do not take one.
 pub const MAX_SAMPLE: f32 = 4.0;
+
+/// The EIA CTCSS tones, Hz.
+pub const CTCSS_HZ: [f32; 21] = [
+    67.0, 71.9, 77.0, 82.5, 88.5, 94.8, 100.0, 107.2, 114.8, 123.0, 131.8, 141.3, 151.4, 162.2, 173.8, 186.2, 203.5,
+    218.1, 233.6, 250.3, 254.1,
+];
 pub use ofdm::{Frame, Ofdm};
 pub use params::OfdmParams;
 pub use qam::Modulation;
