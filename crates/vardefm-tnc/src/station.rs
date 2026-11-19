@@ -53,6 +53,9 @@ pub struct Station {
     levels: bool,
     /// The meter behind `LEVEL`, fed only while `levels` is on.
     level_meter: LevelMeter,
+    /// The last burst decoded since the station started, and when: replayed as
+    /// `RXPEAK` on `LEVELS ON`.
+    last_burst: Option<(AudioLevel, f64)>,
 }
 
 impl Station {
@@ -64,6 +67,7 @@ impl Station {
             rx: Receiver::new(modem.clone()),
             level_meter: LevelMeter::new((HOST_LEVEL_WINDOW_S * modem.fs()) as usize),
             levels: false,
+            last_burst: None,
             modem,
             out: Vec::new(),
             transmitting: false,
@@ -138,6 +142,10 @@ impl Station {
                 // The meter is not fed while off: drop what it held from before.
                 self.level_meter.reset();
                 self.line("OK");
+                // The last real signal, so a meter just opened can show it.
+                if let (true, Some((level, at))) = (on, self.last_burst) {
+                    self.line(rxpeak_line(level, (now - at).max(0.0) as u64));
+                }
             }
             Command::Version => {
                 self.line("OK");
@@ -222,6 +230,10 @@ impl Station {
         }
         let bursts = self.rx.push(samples);
         for b in &bursts {
+            self.last_burst = Some((b.level, now));
+            if self.levels {
+                self.line(rxpeak_line(b.level, 0));
+            }
             self.node.on_burst(now, b);
         }
         let busy = self.rx.busy();
@@ -292,6 +304,13 @@ pub fn level_line(level: AudioLevel, raw_peak_dbfs: f32) -> String {
     format!("LEVEL {:.1} {:.1} {:.1}", tenths(level.rms_dbfs), tenths(level.peak_dbfs), tenths(raw_peak_dbfs))
 }
 
+/// `RXPEAK <peak> <rms> <age>`: the level of a decoded burst in dBFS with one
+/// decimal each (from its preamble to its last data symbol, so without the
+/// txdelay leader or a squelch tail), and how many whole seconds ago it was heard.
+pub fn rxpeak_line(level: AudioLevel, age_s: u64) -> String {
+    format!("RXPEAK {:.1} {:.1} {age_s}", tenths(level.peak_dbfs), tenths(level.rms_dbfs))
+}
+
 /// CRC-32 (IEEE 802.3, the one zlib, zip and Node's `zlib.crc32` compute) of a
 /// KISS frame exactly as KISS clients get it: unescaped, type byte first.
 pub fn frame_crc(frame: &[u8]) -> u32 {
@@ -310,7 +329,7 @@ pub fn unproto_sn_line(snr_db: f32, crcs: &[u32]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{frame_crc, level_line, sn_line, unproto_sn_line, HostOut, Station};
+    use super::{frame_crc, level_line, rxpeak_line, sn_line, unproto_sn_line, HostOut, Station};
     use std::sync::Arc;
     use vardefm_link::LinkConfig;
     use vardefm_modem::{AudioLevel, Modem, OfdmParams};
@@ -360,6 +379,109 @@ mod tests {
         assert_eq!(level_line(AudioLevel::of(&[0.0; 10]), -120.0), "LEVEL -120.0 -120.0 -120.0");
         // With --rx-gain the gained peak can exceed full scale.
         assert_eq!(level_line(AudioLevel { rms_dbfs: -3.0, peak_dbfs: 4.25 }, -7.75), "LEVEL -3.0 4.3 -7.8");
+    }
+
+    /// A connect request from another station at half scale (peaks near -6 dBFS),
+    /// between 0.2 s of silence before and 0.5 s after.
+    fn burst_audio() -> Vec<f32> {
+        let mut b = Station::new("B", Arc::new(Modem::new(OfdmParams::narrow(), 0.1)), LinkConfig::default(), 9);
+        b.host_line(0.0, "MYCALL LA2XYZ");
+        b.host_line(0.0, "CONNECT LA2XYZ LA1ABC");
+        let mut t = 0.0;
+        let tx = loop {
+            t += 0.01;
+            if let Some(tx) = b.poll_tx(t) {
+                break tx;
+            }
+            assert!(t < 10.0, "B never transmitted");
+        };
+        let mut audio = vec![0.0; 9_600];
+        audio.extend(tx.audio.iter().map(|x| 0.5 * x));
+        audio.extend(vec![0.0; 24_000]);
+        audio
+    }
+
+    /// Feeds `audio` from time `t` in chunks. Returns (decode time, level) of each
+    /// burst decoded, the command-port lines and the new time.
+    fn hear(st: &mut Station, t: f64, audio: &[f32]) -> (Vec<(f64, AudioLevel)>, Vec<String>, f64) {
+        let (mut t, mut bursts, mut got) = (t, Vec::new(), Vec::new());
+        for c in audio.chunks(CHUNK) {
+            t += c.len() as f64 / 48_000.0;
+            bursts.extend(st.rx_audio(t, c).into_iter().map(|b| (t, b.level)));
+            got.extend(lines(st));
+        }
+        (bursts, got, t)
+    }
+
+    fn rxpeaks(lines: &[String]) -> Vec<&String> {
+        lines.iter().filter(|l| l.starts_with("RXPEAK ")).collect()
+    }
+
+    #[test]
+    fn rxpeak_format() {
+        let l = AudioLevel { rms_dbfs: -15.04, peak_dbfs: -6.25 };
+        assert_eq!(rxpeak_line(l, 0), "RXPEAK -6.3 -15.0 0");
+        assert_eq!(rxpeak_line(l, 125), "RXPEAK -6.3 -15.0 125");
+        assert_eq!(rxpeak_line(AudioLevel { rms_dbfs: -0.04, peak_dbfs: 0.04 }, 3), "RXPEAK 0.0 0.0 3", "no -0.0");
+    }
+
+    #[test]
+    fn rxpeak_for_every_decoded_burst_while_on() {
+        let audio = burst_audio();
+        let mut st = station();
+        st.host_line(0.0, "LEVELS ON");
+        assert_eq!(lines(&mut st), ["OK"], "no burst heard yet: nothing to replay");
+        let (mut bursts, mut got, t) = hear(&mut st, 0.0, &audio);
+        let (b2, g2, _) = hear(&mut st, t, &audio);
+        bursts.extend(b2);
+        got.extend(g2);
+        assert_eq!(bursts.len(), 2, "both bursts decode");
+        let peaks = rxpeaks(&got);
+        assert_eq!(peaks.len(), 2, "{got:?}");
+        for (line, (_, level)) in peaks.iter().zip(&bursts) {
+            assert_eq!(**line, rxpeak_line(*level, 0), "live bursts have age 0");
+            assert!((level.peak_dbfs + 6.0).abs() < 1.5, "{line}");
+        }
+    }
+
+    #[test]
+    fn no_rxpeak_while_off() {
+        let audio = burst_audio();
+        let mut st = station();
+        let (bursts, got, _) = hear(&mut st, 0.0, &audio);
+        assert_eq!(bursts.len(), 1);
+        assert!(rxpeaks(&got).is_empty(), "{got:?}");
+        st.host_line(0.0, "LEVELS ON");
+        st.host_line(0.0, "LEVELS OFF");
+        lines(&mut st);
+        let (bursts, got, _) = hear(&mut st, 0.0, &audio);
+        assert_eq!(bursts.len(), 1);
+        assert!(rxpeaks(&got).is_empty(), "{got:?}");
+    }
+
+    #[test]
+    fn levels_on_replays_the_last_burst_with_its_age() {
+        let audio = burst_audio();
+        let mut st = station();
+        // Two bursts while LEVELS is off: the replay is the later one.
+        let (_, _, t) = hear(&mut st, 0.0, &audio);
+        let quiet: Vec<f32> = audio.iter().map(|x| 0.5 * x).collect();
+        let (bursts, _, _) = hear(&mut st, t, &quiet);
+        let (heard_at, level) = bursts[0];
+
+        st.host_line(heard_at + 3.9, "LEVELS ON");
+        assert_eq!(lines(&mut st), ["OK".to_string(), rxpeak_line(level, 3)], "age is rounded down");
+        // Every LEVELS ON replays, even while already on.
+        st.host_line(heard_at + 4.0, "LEVELS ON");
+        assert_eq!(lines(&mut st), ["OK".to_string(), rxpeak_line(level, 4)]);
+        st.host_line(heard_at + 4.5, "LEVELS OFF");
+        assert_eq!(lines(&mut st), ["OK"], "no replay on OFF");
+
+        // Remembered since the modem started, not since the host connected.
+        st.host_closed(heard_at + 5.0);
+        lines(&mut st);
+        st.host_line(heard_at + 70.2, "LEVELS ON");
+        assert_eq!(lines(&mut st), ["OK".to_string(), rxpeak_line(level, 70)]);
     }
 
     #[test]
