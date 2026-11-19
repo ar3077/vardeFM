@@ -3,9 +3,7 @@
 use crate::busy::BusyDetector;
 use crate::{Header, Modem, LEVELS};
 use std::sync::Arc;
-
-/// A received sample beyond this is a glitch: full scale is 1.
-const MAX_SAMPLE: f32 = 4.0;
+use vardefm_dsp::MAX_SAMPLE;
 
 /// A received burst.
 #[derive(Clone, Debug)]

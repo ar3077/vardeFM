@@ -516,8 +516,9 @@ fn pre_b_template(body: &[f32], fs: f32, lo: f32) -> Vec<f32> {
 /// The detection band of `src`, filtered on demand: `hp` is the high-passed copy and
 /// `lp` (when the band has an upper edge) the high- then low-passed copy, each
 /// covering `src[..filled]`. Filtering sample by sample from the start gives the same
-/// values as filtering all of `src` at once. A NaN or infinite sample goes in as 0, so
-/// it cannot leave the filters' state NaN and hide every burst after it.
+/// values as filtering all of `src` at once. A NaN goes in as 0 and a huge or infinite
+/// sample clamped (see [`sanitize`]), so neither can leave the filters' state NaN and
+/// hide every burst after it.
 ///
 /// The filters are run over up to [`detect_warmup`] samples before `src` first, so a
 /// search does not start on their start-up transient: in a strong tone, the high-pass
@@ -588,12 +589,14 @@ fn detect_warmup(fs: f32, lo: f32) -> usize {
     (8.0 * fs / lo).ceil() as usize
 }
 
-/// A sample as detection's filters take it: a NaN or infinite one as 0.
+/// A sample as detection's filters take it: a NaN as 0, anything else clamped to
+/// [`MAX_SAMPLE`](crate::MAX_SAMPLE). The streaming receiver has already done that; a
+/// recording read whole (`decode_all`, a corrupt float WAV) has not.
 fn sanitize(x: f32) -> f32 {
-    if x.is_finite() {
-        x
-    } else {
+    if x.is_nan() {
         0.0
+    } else {
+        x.clamp(-crate::MAX_SAMPLE, crate::MAX_SAMPLE)
     }
 }
 
@@ -877,7 +880,7 @@ mod tests {
         }
     }
 
-    /// A NaN or an infinite sample before a frame, or a long run of exact silence,
+    /// A NaN, an infinite or a huge finite sample before a frame, or a long run of exact silence,
     /// does not leave detection's filters stuck: the frame after it is still found
     /// where it is found without them, and silence alone finds nothing.
     #[test]
@@ -891,7 +894,7 @@ mod tests {
             rx.extend(ofdm.modulate_with_leader(&random_frame(&ofdm, Modulation::Qpsk, 4, 3), 0.1));
             rx.extend(vec![0.0; 2000]);
             let truth = ofdm.detect(&rx, 0).expect("frame not detected");
-            for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 3e38, -3e38] {
                 let mut x = rx.clone();
                 x[1000..1010].fill(bad);
                 let got = ofdm.detect(&x, 0);
