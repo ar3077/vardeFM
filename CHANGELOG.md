@@ -6,6 +6,25 @@ run the same minor version.
 
 ## [Unreleased]
 
+### Added
+- **Receive level reports (`LEVELS`, VardeFM only).** For a host's level meter: after
+  `LEVELS ON` the modem sends `LEVEL <rms> <peak> <raw>` (dBFS, one decimal) on the
+  command port about every 0.25 s while not transmitting, so a meter can follow the sound
+  card's recording slider live. The measurement is the one `modem --levels` uses (no
+  filtering, no AGC). `raw` is the peak before any input gain; today it always equals
+  `peak`. After every decoded burst, of any kind, `RXPEAK <peak> <rms> 0` gives that
+  burst's level (preamble to last data symbol), just before its `SN` / `UNPROTO SN` line,
+  so the host can mark the last real signal apart from open-squelch hiss. Every
+  `LEVELS ON` is also answered with one `RXPEAK` for the last burst decoded since the
+  modem started, with its age in whole seconds. Off by default and off again when the
+  command-port client disconnects; a host that never sends `LEVELS` sees no change. Real
+  VARA answers `WRONG`. About 75 bytes a second while on. Details in docs/PROTOCOL.md §4.1
+  and §4.2 ("Receive level").
+
+### Changed
+- The level meter (`modem --levels`, `monitor` and the new `LEVEL` reports) skips NaN
+  and infinite samples from the sound card instead of showing NaN or inf.
+
 ## [0.3.2-ortoo.1] - 2026-11-16
 
 This build is upstream 0.3.2 (digipeating included) plus unconnected broadcasts and S/N

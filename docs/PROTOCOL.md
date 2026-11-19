@@ -438,6 +438,7 @@ Each command gets `OK`, or `WRONG` if it is invalid.
 | `VERSION` | `OK`, then `VERSION VardeFM <version>`. |
 | `CHAT ON` / `CHAT OFF` | Send `SN` reports (§4.2) or not. Off by default, and off again when the command-port client disconnects. VARA's other `CHAT ON` effects (an implied `LISTEN ON`, keyboard-to-keyboard handover timing) are not copied. |
 | `UNPROTO SN ON` / `UNPROTO SN OFF` | VardeFM only: send `UNPROTO SN` reports (§4.2, §4.5) or not. Off by default, and off again when the command-port client disconnects. Real VARA answers `WRONG`, which tells a host the reports are not available. |
+| `LEVELS ON` / `LEVELS OFF` | VardeFM only: send `LEVEL` and `RXPEAK` reports of the receive audio level (§4.2, "Receive level") or not. `LEVELS ON` is answered with `OK` and then, if any burst has been decoded since the modem started, one `RXPEAK` for the last of them. Off by default, and off again when the command-port client disconnects. Real VARA and VardeFM before 0.3.2-ortoo.2 answer `WRONG`, which tells a host the reports are not available. |
 | `PUBLIC ON/OFF`, `COMPRESSION OFF/TEXT/FILES`, `CWID ON/OFF`, `BW500/BW2300/BW2750`, `WINLINK SESSION`, `P2P SESSION` | Accepted (`OK`), no effect. |
 
 ### 4.2 Modem → host
@@ -452,6 +453,8 @@ Each command gets `OK`, or `WRONG` if it is invalid.
 | `BUSY ON` / `BUSY OFF` | Channel activity heard (audio in the carrier band at least 6 dB above the background level and above −40 dBFS, or a frame being received). The band is 422–2672 Hz in narrow mode and 400–6000 Hz in wide mode (filter edges, 6–9 dB down); sound outside it, such as a CTCSS tone, mains hum or hiss above the band, does not count. A steady open-squelch hiss becomes the background within about 2 s. After the modem's own transmission nothing is measured until the received audio comes back (at most 1 s), nor for 20 ms after that, and a busy hold from before the transmission ends. |
 | `SN <dB>` | With `CHAT ON` only: after every burst received from the session peer, its S/N with one decimal, e.g. `SN 12.3` or `SN -1.5`. That covers the connect request or answer that opens the session and every burst of the session after it. Bursts with another session id (other stations' sessions on the frequency) and bursts heard while not in a session are not reported. Sent after `CONNECTED`, never before it. On a routed session (§3.4) it is the S/N of the last hop: the peer's burst as the last digipeater repeated it, not the peer's own signal at that digipeater. See the note below the table. |
 | `UNPROTO SN <dB> <crc> …` | VardeFM only, with `UNPROTO SN ON`: after every received Unproto burst (§3.5) that delivered at least one frame to the KISS port, the burst's S/N (formatted as for `SN`) and then, for each of those frames in order, the CRC-32 of the frame as 8 upper-case hex digits. Sent in any state, including during a session. How a host uses it: §4.5. |
+| `LEVEL <rms> <peak> <raw>` | VardeFM only, with `LEVELS ON`: about every 0.25 s while not transmitting, in any state, including during a session. The receive level in dBFS, one decimal each, e.g. `LEVEL -27.3 -18.9 -18.9`. See "Receive level" below. |
+| `RXPEAK <peak> <rms> <age>` | VardeFM only, with `LEVELS ON`: after every decoded burst, its peak and RMS level in dBFS (one decimal each) and `0`; and once straight after the `OK` to every `LEVELS ON`, the last burst decoded since the modem started, with its age in whole seconds, e.g. `RXPEAK -6.2 -15.8 42`. See "Receive level" below. |
 | `IAMALIVE` | Every 60 s. |
 
 **What `SN` measures.** It is the receiver's own estimate, from the pilots, of the SNR per
@@ -476,6 +479,68 @@ capped at 60 dB. Hosts that show a meter may want to smooth it.
 
 The VARA document lists `SN value` as "S/N of the received frame", sent only with
 `CHAT ON`. Pat ignores the line.
+
+#### Receive level (`LEVELS`)
+For a host's level meter, for example a dialog the user opens while setting the sound
+card's recording level or the radio's volume. The host sends `LEVELS ON` when the meter
+opens and `LEVELS OFF` when it closes. It is off by default and off again when the
+command-port client disconnects, so the next host starts without it. A host finds out
+whether the modem has it by sending `LEVELS ON`: real VARA and VardeFM before
+0.3.2-ortoo.2 answer `WRONG`.
+
+**`LEVEL <rms> <peak> <raw>`**, about every 0.25 s:
+
+    LEVEL -27.3 -18.9 -18.9
+
+- The audio measured is the received audio as the sound card delivers it (the chosen
+  channel, resampled to 48 kHz if the card runs at another rate), before any filtering:
+  the modem has no AGC. 0 dBFS is full scale.
+- Each line covers the 0.25 s since the last one (blocks follow each other without
+  overlap): `rms` = 10·log₁₀ of the mean of the squared samples, `peak` = 20·log₁₀ of the
+  largest absolute sample. Silence reads `-120.0`. A NaN or infinite sample from the sound
+  card is skipped.
+- `rms` and `peak` are of the audio the receiver gets. `raw` is the peak before any input
+  gain, as the sound card delivered it, so only `raw` shows clipping in the sound card
+  (`raw` at or near 0 dBFS). Today the modem applies no input gain and `raw` always equals
+  `peak`; a later input gain option will make them differ. With such a gain, `rms` and
+  `peak` can be above 0 dBFS without anything clipping, so a host must accept values
+  above 0.
+- No `LEVEL` lines are sent while the modem transmits (between `PTT ON` and `PTT OFF`).
+  The block in progress at key-up is dropped, so the first line comes 0.25 s after
+  reception resumes. That first block may include the radio's own audio returning after
+  the transmission, such as a squelch opening.
+- Received bursts should peak around -6 dBFS (docs/RADIO.md). With the squelch open and
+  nothing on the channel, `LEVEL` shows the hiss.
+
+**`RXPEAK <peak> <rms> <age>`**, the level of a decoded burst, to tell a real signal
+apart from open-squelch hiss:
+
+    RXPEAK -6.2 -15.8 0
+
+- Sent after every burst whose header decoded, of any kind and from any station: the
+  session peer, other stations' sessions, digipeater repeats, Unproto broadcasts and
+  control bursts (acknowledgements, polls). A burst counts even if some or all of its
+  payload codewords failed. A burst whose header did not decode gives no line.
+- The span measured runs from the start of the burst's preamble to the end of its last
+  data symbol (the last header symbol for a burst without payload). It leaves out the
+  txdelay leader before the preamble and any squelch tail after the burst. `peak` and
+  `rms` are in dBFS with one decimal, measured like `LEVEL`'s `peak` and `rms`.
+- On the command port the line comes just before that burst's `SN` or `UNPROTO SN` line,
+  if it has one.
+- `age` is in whole seconds, rounded down: `0` for a burst just decoded. Straight after
+  the `OK` to **every** `LEVELS ON`, even when already on, the modem sends one `RXPEAK`
+  for the last burst it decoded since it started, with its real age. That burst may be
+  from before the host connected or from while `LEVELS` was off, so a meter just opened
+  can show the last real signal at once. If no burst has been decoded yet, nothing
+  follows the `OK`. Age is counted on the modem's clock, which is the input sound card's
+  sample count since the modem started, so it does not advance while the sound card
+  delivers no audio.
+
+**Traffic.** While on, the reports add about 4 lines a second, about 75 bytes a second,
+to the command port only (the data port is not affected). Measuring costs the modem
+next to nothing, and it does not change the modem's timing, so the meter can stay open
+during a session. The host must keep reading the command port while `LEVELS` is on, as it
+must for any VARA host. It should send `LEVELS OFF` when its meter closes.
 
 ### 4.3 Data port
 While connected, bytes written are sent and received bytes are delivered. Any byte value
