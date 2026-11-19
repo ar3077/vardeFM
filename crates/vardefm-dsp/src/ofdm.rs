@@ -752,9 +752,10 @@ mod tests {
     /// first milliseconds of a search. In a strong CTCSS tone, a search that starts
     /// over the 25 ms before preamble A finds the frame exactly where a search from the
     /// start of the recording does. Starts within two cyclic prefixes of preamble A are
-    /// left out: a search that starts on preamble A's own plateau can miss it, with or
-    /// without a tone, and the receiver's searches start earlier than that (at least
-    /// `keep` minus the audio a detection needs, about 11 ms in narrow, before it).
+    /// left out: a search that starts within about 1.5 ms of preamble A can miss it, with
+    /// or without a tone. Streaming a 20 dB burst in pushes of 256 to 4096 samples, the
+    /// receiver's search that found it started at least 17 ms (wide) or 35 ms (narrow)
+    /// before preamble A.
     #[test]
     fn a_search_starting_just_before_a_frame_finds_it_in_a_tone() {
         let mut missed = Vec::new();
