@@ -4,9 +4,10 @@
 //! it what to transmit, and collect its host output. It has no threads or clock.
 
 use crate::host::{parse, Command};
+use crate::level::{LevelMeter, HOST_LEVEL_WINDOW_S};
 use std::sync::Arc;
 use vardefm_link::{Link, LinkConfig, LinkEvent, Node, TxInfo};
-use vardefm_modem::{Header, Modem, Receiver, RxBurst};
+use vardefm_modem::{AudioLevel, Header, Modem, Receiver, RxBurst};
 
 /// Output for the host application.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,6 +48,11 @@ pub struct Station {
     /// `UNPROTO SN ON`: report the S/N of every received Unproto burst, with the
     /// CRC-32 of each frame it carried (`UNPROTO SN <dB> <crc> …`).
     unproto_sn: bool,
+    /// `LEVELS ON`: report the receive level every [`HOST_LEVEL_WINDOW_S`] while
+    /// not transmitting (`LEVEL <rms> <peak> <raw>`).
+    levels: bool,
+    /// The meter behind `LEVEL`, fed only while `levels` is on.
+    level_meter: LevelMeter,
 }
 
 impl Station {
@@ -56,6 +62,8 @@ impl Station {
             name: name.to_string(),
             node: Node::new(Link::new(modem.clone(), cfg, seed)),
             rx: Receiver::new(modem.clone()),
+            level_meter: LevelMeter::new((HOST_LEVEL_WINDOW_S * modem.fs()) as usize),
+            levels: false,
             modem,
             out: Vec::new(),
             transmitting: false,
@@ -125,6 +133,12 @@ impl Station {
                 self.unproto_sn = on;
                 self.line("OK");
             }
+            Command::Levels(on) => {
+                self.levels = on;
+                // The meter is not fed while off: drop what it held from before.
+                self.level_meter.reset();
+                self.line("OK");
+            }
             Command::Version => {
                 self.line("OK");
                 self.line(format!("VERSION {}", crate::VERSION));
@@ -145,11 +159,12 @@ impl Station {
     }
 
     /// The host closed the command port: drop any session, and forget its settings
-    /// that only matter to it (`CHAT`, `UNPROTO SN`), so the next host starts from
-    /// the defaults.
+    /// that only matter to it (`CHAT`, `UNPROTO SN`, `LEVELS`), so the next host
+    /// starts from the defaults.
     pub fn host_closed(&mut self, now: f64) {
         self.chat = false;
         self.unproto_sn = false;
+        self.levels = false;
         self.node.link.abort(now);
     }
 
@@ -169,6 +184,7 @@ impl Station {
         let audio = self.modem.modulate(&burst);
         self.transmitting = true;
         self.rx.reset();
+        self.level_meter.reset();
         self.line("PTT ON");
         Some(TxStart {
             seconds: audio.len() as f32 / self.modem.fs(),
@@ -213,6 +229,12 @@ impl Station {
             self.busy_reported = busy;
             self.line(if busy { "BUSY ON" } else { "BUSY OFF" });
         }
+        if self.levels {
+            if let Some(level) = self.level_meter.push(samples) {
+                // No input gain yet: the raw peak is the peak.
+                self.line(level_line(level, level.peak_dbfs));
+            }
+        }
         bursts
     }
 
@@ -248,11 +270,26 @@ impl Station {
     }
 }
 
+/// `v` rounded to one decimal for a host line: never "-0.0", and 0 if not finite.
+fn tenths(v: f32) -> f32 {
+    let v = (v * 10.0).round() / 10.0;
+    if v == 0.0 || !v.is_finite() {
+        0.0
+    } else {
+        v
+    }
+}
+
 /// `SN <dB>` with one decimal, as VARA sends it (e.g. `SN 12.3`, `SN -2.0`).
 pub fn sn_line(snr_db: f32) -> String {
-    let v = (snr_db * 10.0).round() / 10.0;
-    let v = if v == 0.0 || !v.is_finite() { 0.0 } else { v }; // no "-0.0"
-    format!("SN {v:.1}")
+    format!("SN {:.1}", tenths(snr_db))
+}
+
+/// `LEVEL <rms> <peak> <raw>`: the receive level in dBFS with one decimal each.
+/// `rms` and `peak` are of the audio the receiver gets; `raw` is the peak the sound
+/// card delivered, before any input gain (only that one shows sound-card clipping).
+pub fn level_line(level: AudioLevel, raw_peak_dbfs: f32) -> String {
+    format!("LEVEL {:.1} {:.1} {:.1}", tenths(level.rms_dbfs), tenths(level.peak_dbfs), tenths(raw_peak_dbfs))
 }
 
 /// CRC-32 (IEEE 802.3, the one zlib, zip and Node's `zlib.crc32` compute) of a
@@ -273,7 +310,133 @@ pub fn unproto_sn_line(snr_db: f32, crcs: &[u32]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{frame_crc, sn_line, unproto_sn_line};
+    use super::{frame_crc, level_line, sn_line, unproto_sn_line, HostOut, Station};
+    use std::sync::Arc;
+    use vardefm_link::LinkConfig;
+    use vardefm_modem::{AudioLevel, Modem, OfdmParams};
+
+    /// 10 ms at 48 kHz, as a sound card usually delivers it.
+    const CHUNK: usize = 480;
+
+    fn station() -> Station {
+        Station::new("A", Arc::new(Modem::new(OfdmParams::narrow(), 0.1)), LinkConfig::default(), 7)
+    }
+
+    /// Quiet noise-like audio (about -31 dBFS rms), never loud enough to read busy.
+    fn hiss() -> Vec<f32> {
+        (0..CHUNK).map(|i| 0.05 * ((i * 7919) % 200) as f32 / 100.0 - 0.05).collect()
+    }
+
+    /// Command-port lines since the last call.
+    fn lines(st: &mut Station) -> Vec<String> {
+        st.take_output()
+            .into_iter()
+            .filter_map(|o| match o {
+                HostOut::Line(l) => Some(l),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Feeds `chunks` chunks of hiss from time `t`; returns the `LEVEL` lines and the new time.
+    fn listen(st: &mut Station, t: f64, chunks: usize) -> (Vec<String>, f64) {
+        let mut t = t;
+        let mut got = Vec::new();
+        for _ in 0..chunks {
+            t += CHUNK as f64 / 48_000.0;
+            st.rx_audio(t, &hiss());
+            got.extend(lines(st).into_iter().filter(|l| l.starts_with("LEVEL ")));
+        }
+        (got, t)
+    }
+
+    #[test]
+    fn level_format() {
+        let l = AudioLevel { rms_dbfs: -27.34, peak_dbfs: -18.35 };
+        assert_eq!(level_line(l, l.peak_dbfs), "LEVEL -27.3 -18.4 -18.4");
+        assert_eq!(level_line(l, -6.04), "LEVEL -27.3 -18.4 -6.0");
+        let zero = AudioLevel { rms_dbfs: -0.04, peak_dbfs: 0.0 };
+        assert_eq!(level_line(zero, 0.04), "LEVEL 0.0 0.0 0.0", "no -0.0");
+        assert_eq!(level_line(AudioLevel::of(&[0.0; 10]), -120.0), "LEVEL -120.0 -120.0 -120.0");
+        // With --rx-gain the gained peak can exceed full scale.
+        assert_eq!(level_line(AudioLevel { rms_dbfs: -3.0, peak_dbfs: 4.25 }, -7.75), "LEVEL -3.0 4.3 -7.8");
+    }
+
+    #[test]
+    fn level_lines_only_while_on() {
+        let mut st = station();
+        let (got, t) = listen(&mut st, 0.0, 100);
+        assert!(got.is_empty(), "off by default: {got:?}");
+
+        st.host_line(t, "LEVELS ON");
+        assert_eq!(lines(&mut st), ["OK"]);
+        // 1 s of audio in 10 ms chunks: one line per 0.25 s.
+        let (got, t) = listen(&mut st, t, 100);
+        assert_eq!(got.len(), 4, "{got:?}");
+        for l in &got {
+            let v: Vec<f32> = l["LEVEL ".len()..].split(' ').map(|w| w.parse().unwrap()).collect();
+            assert_eq!(v.len(), 3, "{l}");
+            assert!((v[0] + 30.8).abs() < 0.5, "rms of the hiss: {l}");
+            assert!(v[1] > v[0] && v[1] < 0.0, "{l}");
+            assert_eq!(v[2], v[1], "raw = peak until there is an input gain: {l}");
+        }
+
+        st.host_line(t, "LEVELS OFF");
+        assert_eq!(lines(&mut st), ["OK"]);
+        let (got, _) = listen(&mut st, t, 100);
+        assert!(got.is_empty(), "{got:?}");
+    }
+
+    #[test]
+    fn levels_off_again_when_the_host_goes_away() {
+        let mut st = station();
+        st.host_line(0.0, "LEVELS ON");
+        let (got, t) = listen(&mut st, 0.0, 25);
+        assert_eq!(got.len(), 1, "{got:?}");
+        st.host_closed(t);
+        let (got, _) = listen(&mut st, t, 100);
+        assert!(got.is_empty(), "the next host starts with LEVELS off: {got:?}");
+    }
+
+    #[test]
+    fn levels_on_starts_a_fresh_window() {
+        let mut st = station();
+        st.host_line(0.0, "LEVELS ON");
+        let (_, t) = listen(&mut st, 0.0, 20);
+        st.host_line(t, "LEVELS OFF");
+        st.host_line(t, "LEVELS ON");
+        lines(&mut st);
+        let (got, t) = listen(&mut st, t, 24);
+        assert!(got.is_empty(), "the 0.2 s from before OFF were counted: {got:?}");
+        let (got, _) = listen(&mut st, t, 1);
+        assert_eq!(got.len(), 1);
+    }
+
+    #[test]
+    fn no_level_lines_while_transmitting() {
+        let mut st = station();
+        st.host_line(0.0, "MYCALL LA1ABC");
+        st.host_line(0.0, "LEVELS ON");
+        // 0.2 s of a window before key-up: thrown away with the key-up.
+        let (_, mut t) = listen(&mut st, 0.0, 20);
+        st.host_line(t, "CONNECT LA1ABC LA2XYZ");
+        let tx = loop {
+            t += 0.01;
+            if let Some(tx) = st.poll_tx(t) {
+                break tx;
+            }
+            assert!(t < 10.0, "the connect request never went out");
+        };
+        assert!(lines(&mut st).contains(&"PTT ON".to_string()));
+        let (got, t) = listen(&mut st, t, (tx.seconds * 100.0) as usize + 50);
+        assert!(got.is_empty(), "LEVEL while transmitting: {got:?}");
+        st.tx_done(t);
+        lines(&mut st);
+        let (got, t) = listen(&mut st, t, 24);
+        assert!(got.is_empty(), "the partial window from before key-up was kept: {got:?}");
+        let (got, _) = listen(&mut st, t, 1);
+        assert_eq!(got.len(), 1, "{got:?}");
+    }
 
     #[test]
     fn sn_format() {

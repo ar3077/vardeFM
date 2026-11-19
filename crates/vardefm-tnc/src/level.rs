@@ -15,6 +15,10 @@ const QUIET_DBFS: f32 = -30.0;
 /// Peaks below this mean there is no audio at all.
 const SILENT_DBFS: f32 = -80.0;
 
+/// Seconds per `LEVEL` report to the host (`LEVELS ON`), short enough for a bar
+/// to follow the recording slider.
+pub const HOST_LEVEL_WINDOW_S: f32 = 0.25;
+
 /// How a level compares with the target.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {
@@ -78,13 +82,14 @@ impl LevelMeter {
         Self { window: window.max(1), sq: 0.0, peak: 0.0, n: 0 }
     }
 
-    /// Add samples; returns the level once a window is full.
+    /// Add samples; returns the level once a window is full. A NaN or infinite
+    /// sample is a glitch: it is skipped and does not count towards the window.
     pub fn push(&mut self, samples: &[f32]) -> Option<AudioLevel> {
-        for &x in samples {
+        for &x in samples.iter().filter(|x| x.is_finite()) {
             self.sq += (x * x) as f64;
             self.peak = self.peak.max(x.abs());
+            self.n += 1;
         }
-        self.n += samples.len();
         if self.n < self.window {
             return None;
         }
@@ -141,6 +146,30 @@ mod tests {
         assert!(m.push(&[0.0; 50]).is_none(), "the window starts over");
         let quiet = m.push(&[0.0; 50]).unwrap();
         assert_eq!(Verdict::of(quiet), Verdict::Silent);
+    }
+
+    #[test]
+    fn host_meter_reports_four_times_a_second() {
+        // 48 kHz in 10 ms chunks, as sound cards usually deliver it.
+        let mut m = LevelMeter::new((HOST_LEVEL_WINDOW_S * 48_000.0) as usize);
+        let tone: Vec<f32> = (0..480).map(|i| 0.25 * (i as f32 * 0.1).sin()).collect();
+        let reports: Vec<usize> = (1..=100).filter(|_| m.push(&tone).is_some()).collect();
+        assert_eq!(reports, [25, 50, 75, 100]);
+    }
+
+    #[test]
+    fn meter_skips_samples_that_are_not_numbers() {
+        // A NaN or Inf from the sound card is a glitch (the receiver replaces it too); it
+        // must not turn the reading into NaN or inf.
+        let mut m = LevelMeter::new(100);
+        let mut x = vec![0.5f32; 100];
+        x[10] = f32::NAN;
+        x[20] = f32::INFINITY;
+        x[30] = f32::NEG_INFINITY;
+        assert!(m.push(&x[..99]).is_none(), "the three glitches do not count towards the window");
+        let l = m.push(&[0.5; 4]).unwrap();
+        assert!((l.peak_dbfs - 20.0 * 0.5f32.log10()).abs() < 0.01, "{l:?}");
+        assert!((l.rms_dbfs - l.peak_dbfs).abs() < 0.01, "{l:?}");
     }
 
     #[test]

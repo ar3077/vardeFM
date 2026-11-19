@@ -23,6 +23,9 @@ pub enum Command {
     /// `UNPROTO SN ON/OFF` (VardeFM only): whether to send `UNPROTO SN` reports
     /// for received Unproto bursts.
     UnprotoSn(bool),
+    /// `LEVELS ON/OFF` (VardeFM only): whether to send `LEVEL` reports of the
+    /// receive audio level.
+    Levels(bool),
     /// Accepted for compatibility, no effect (PUBLIC, COMPRESSION, CWID, BWxxx, ... SESSION).
     Ignored,
 }
@@ -69,6 +72,7 @@ pub fn parse(line: &str) -> Result<Command, ()> {
         "VERSION" if args.is_empty() => Ok(Command::Version),
         "CHAT" if args.len() == 1 => on_off(arg(0)).map(Command::Chat),
         "UNPROTO" if args.len() == 2 && arg(0).as_deref() == Some("SN") => on_off(arg(1)).map(Command::UnprotoSn),
+        "LEVELS" if args.len() == 1 => on_off(arg(0)).map(Command::Levels),
         "PUBLIC" | "CWID" if args.len() == 1 => on_off(arg(0)).map(|_| Command::Ignored),
         "COMPRESSION" if matches!(arg(0).as_deref(), Some("OFF" | "TEXT" | "FILES")) && args.len() == 1 => {
             Ok(Command::Ignored)
@@ -127,6 +131,11 @@ mod tests {
         assert_eq!(parse("UNPROTO SN ON"), Ok(Command::UnprotoSn(true)));
         assert_eq!(parse("unproto sn off"), Ok(Command::UnprotoSn(false)));
         for bad in ["UNPROTO", "UNPROTO SN", "UNPROTO ON", "UNPROTO SN MAYBE", "UNPROTO SN ON X"] {
+            assert_eq!(parse(bad), Err(()), "{bad}");
+        }
+        assert_eq!(parse("LEVELS ON"), Ok(Command::Levels(true)));
+        assert_eq!(parse("levels off"), Ok(Command::Levels(false)));
+        for bad in ["LEVELS", "LEVELS MAYBE", "LEVELS ON X", "LEVEL ON", "LEVELS SN ON"] {
             assert_eq!(parse(bad), Err(()), "{bad}");
         }
         for ok in ["PUBLIC ON", "COMPRESSION TEXT", "CWID ON", "BW2300", "P2P SESSION", "WINLINK SESSION"] {
