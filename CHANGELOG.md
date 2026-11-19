@@ -6,6 +6,11 @@ run the same minor version.
 
 ## [Unreleased]
 
+## [0.3.2-ortoo.2] - 2026-11-19
+
+Host-interface additions only: on the air this build is identical to 0.3.2-ortoo.1, with
+the same compatibility.
+
 ### Added
 - **Receive level reports (`LEVELS`, VardeFM only).** For a host's level meter: after
   `LEVELS ON` the modem sends `LEVEL <rms> <peak> <raw>` (dBFS, one decimal) on the
