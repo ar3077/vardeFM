@@ -249,6 +249,12 @@ impl Ofdm {
         self.detect_chunked(rx, from, 8 * self.p.symbol_len())
     }
 
+    /// Samples before `from` that [`detect`](Self::detect) reads to settle its filters.
+    /// A caller that drops old audio should keep this much before where it searches next.
+    pub fn detect_history(&self) -> usize {
+        detect_warmup(self.p.fs, self.p.detect_band_hz.0)
+    }
+
     /// [`detect`](Self::detect), filtering `chunk` samples past what the search needs
     /// each time it runs out (fewer, larger steps; the result does not depend on it).
     fn detect_chunked(&self, rx: &[f32], from: usize, chunk: usize) -> Option<usize> {
@@ -263,7 +269,7 @@ impl Ofdm {
             built = pre_b_template(&self.pre_b_body, self.p.fs, lo);
             &built
         };
-        let mut band = Band::new(&rx[from.min(rx.len())..], self.p.fs, lo, hi);
+        let mut band = Band::new(rx, from, self.p.fs, lo, hi);
         self.detect_in(&mut band, template, from, chunk)
     }
 
@@ -512,6 +518,10 @@ fn pre_b_template(body: &[f32], fs: f32, lo: f32) -> Vec<f32> {
 /// covering `src[..filled]`. Filtering sample by sample from the start gives the same
 /// values as filtering all of `src` at once. A NaN or infinite sample goes in as 0, so
 /// it cannot leave the filters' state NaN and hide every burst after it.
+///
+/// The filters are run over up to [`detect_warmup`] samples before `src` first, so a
+/// search does not start on their start-up transient: in a strong tone, the high-pass
+/// would otherwise ring at its corner over the first milliseconds of every search.
 struct Band<'a> {
     src: &'a [f32],
     hp_f: Chain,
@@ -521,9 +531,18 @@ struct Band<'a> {
 }
 
 impl<'a> Band<'a> {
-    fn new(src: &'a [f32], fs: f32, lo: f32, hi: Option<f32>) -> Self {
-        let lp_f = hi.map(|hi| Chain::lowpass4(fs, hi));
-        Self { src, hp_f: Chain::highpass8(fs, lo), lp_f, hp: Vec::new(), lp: Vec::new() }
+    /// The band of `rx[from..]`, its filters warmed up on the audio before `from`.
+    fn new(rx: &'a [f32], from: usize, fs: f32, lo: f32, hi: Option<f32>) -> Self {
+        let from = from.min(rx.len());
+        let mut hp_f = Chain::highpass8(fs, lo);
+        let mut lp_f = hi.map(|hi| Chain::lowpass4(fs, hi));
+        for &x in &rx[from.saturating_sub(detect_warmup(fs, lo))..from] {
+            let y = hp_f.process(sanitize(x));
+            if let Some(lp) = &mut lp_f {
+                lp.process(y);
+            }
+        }
+        Self { src: &rx[from..], hp_f, lp_f, hp: Vec::new(), lp: Vec::new() }
     }
 
     fn len(&self) -> usize {
@@ -538,7 +557,7 @@ impl<'a> Band<'a> {
     fn fill_to(&mut self, end: usize) {
         let end = end.min(self.src.len());
         for &x in &self.src[self.hp.len().min(end)..end] {
-            let y = self.hp_f.process(if x.is_finite() { x } else { 0.0 });
+            let y = self.hp_f.process(sanitize(x));
             self.hp.push(y);
             if let Some(lp) = &mut self.lp_f {
                 self.lp.push(lp.process(y));
@@ -559,6 +578,22 @@ impl<'a> Band<'a> {
         } else {
             &self.hp
         }
+    }
+}
+
+/// Samples of history [`Band`] warms its filters on: about ten time constants of the
+/// high-pass's slowest-decaying section (Q 2.56, time constant Q / (pi lo)), so its
+/// start-up transient has decayed by about 85 dB when the search starts.
+fn detect_warmup(fs: f32, lo: f32) -> usize {
+    (8.0 * fs / lo).ceil() as usize
+}
+
+/// A sample as detection's filters take it: a NaN or infinite one as 0.
+fn sanitize(x: f32) -> f32 {
+    if x.is_finite() {
+        x
+    } else {
+        0.0
     }
 }
 
@@ -657,6 +692,11 @@ mod tests {
     use super::*;
     use crate::qam::Modulation;
 
+    const CTCSS_HZ: [f32; 21] = [
+        67.0, 71.9, 77.0, 82.5, 88.5, 94.8, 100.0, 107.2, 114.8, 123.0, 131.8, 141.3, 151.4, 162.2, 173.8, 186.2,
+        203.5, 218.1, 233.6, 250.3, 254.1,
+    ];
+
     fn roundtrip(p: OfdmParams, m: Modulation, lead: usize) {
         let ofdm = Ofdm::new(p);
         let nsym = 20;
@@ -695,10 +735,6 @@ mod tests {
     /// the frame where it finds it without a tone (#12).
     #[test]
     fn ctcss_tones_do_not_hide_a_frame() {
-        const CTCSS_HZ: [f32; 21] = [
-            67.0, 71.9, 77.0, 82.5, 88.5, 94.8, 100.0, 107.2, 114.8, 123.0, 131.8, 141.3, 151.4, 162.2, 173.8, 186.2,
-            203.5, 218.1, 233.6, 250.3, 254.1,
-        ];
         let mut missed = Vec::new();
         for (p, deviation_hz) in [(OfdmParams::narrow(), 2500.0), (OfdmParams::wide(), 3000.0)] {
             let ofdm = Ofdm::new(p);
@@ -720,6 +756,79 @@ mod tests {
             }
         }
         assert!(missed.is_empty(), "{missed:#?}");
+    }
+
+    /// The receiver starts a new search on every push, so preamble A can land in the
+    /// first milliseconds of a search. In a strong CTCSS tone, a search that starts
+    /// over the 25 ms before preamble A finds the frame exactly where a search from the
+    /// start of the recording does. Starts within two cyclic prefixes of preamble A are
+    /// left out: a search that starts on preamble A's own plateau can miss it, with or
+    /// without a tone, and the receiver's searches start earlier than that (at least
+    /// `keep` minus the audio a detection needs, about 11 ms in narrow, before it).
+    #[test]
+    fn a_search_starting_just_before_a_frame_finds_it_in_a_tone() {
+        let mut missed = Vec::new();
+        for (p, deviation_hz) in [(OfdmParams::narrow(), 2500.0), (OfdmParams::wide(), 3000.0)] {
+            let ofdm = Ofdm::new(p);
+            let (l, ncp) = (ofdm.p.symbol_len(), ofdm.p.ncp);
+            let mut rx = vec![0.0; 4000];
+            rx.extend(ofdm.modulate_with_leader(&random_frame(&ofdm, Modulation::Qpsk, 4, 1), 0.15));
+            rx.extend(vec![0.0; 1000]);
+            let truth = ofdm.detect(&rx, 0).expect("frame not detected without a tone");
+            let a_start = truth - ncp - l;
+            let a = 1500.0 / deviation_hz;
+            // Starts over the 25 ms before preamble A, every half millisecond.
+            let step = (ofdm.p.fs / 2000.0) as usize;
+            let span = (ofdm.p.fs * 0.025) as usize;
+            for f in CTCSS_HZ {
+                for ph in [0.0, 1.9] {
+                    let w = 2.0 * std::f32::consts::PI * f / ofdm.p.fs;
+                    let x: Vec<f32> = rx.iter().enumerate().map(|(i, v)| v + a * (w * i as f32 + ph).sin()).collect();
+                    let settled = ofdm.detect(&x, 0);
+                    assert!(settled.is_some_and(|b| b.abs_diff(truth) <= ncp / 4), "{} {f} Hz", ofdm.p.name);
+                    for from in (a_start - span..=a_start - 2 * ncp).step_by(step) {
+                        let got = ofdm.detect(&x, from);
+                        if got != settled {
+                            missed.push(format!(
+                                "{} {f} Hz phase {ph} from A - {}: {got:?}, want {settled:?} (no tone {truth})",
+                                ofdm.p.name,
+                                a_start - from
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(missed.is_empty(), "{} misses: {missed:#?}", missed.len());
+    }
+
+    /// A search's filters start settled: the band of `rx[from..]` is the band of all of
+    /// `rx` from `from` on, to within 1e-4 of a strong tone's amplitude, so a search does
+    /// not start on the high-pass ringing at its corner.
+    #[test]
+    fn detection_filters_start_settled() {
+        for p in [OfdmParams::narrow(), OfdmParams::wide()] {
+            let ofdm = Ofdm::new(p);
+            let (lo, hi) = ofdm.p.detect_band_hz;
+            let mut rng = Prng::new(11);
+            for f in [CTCSS_HZ[0], CTCSS_HZ[20]] {
+                let a = 0.6;
+                let w = 2.0 * std::f32::consts::PI * f / ofdm.p.fs;
+                let rx: Vec<f32> = (0..20_000).map(|i| a * (w * i as f32 + 0.7).sin() + 0.01 * rng.bpsk()).collect();
+                let mut all = Band::new(&rx, 0, ofdm.p.fs, lo, hi);
+                all.fill_to(rx.len());
+                for from in [ofdm.detect_history(), 5000, 12_345] {
+                    let mut band = Band::new(&rx, from, ofdm.p.fs, lo, hi);
+                    band.fill_to(rx.len());
+                    for (name, got, want) in
+                        [("hp", band.hp(), &all.hp()[from..]), ("sc", band.sc(), &all.sc()[from..])]
+                    {
+                        let err = got.iter().zip(want).map(|(g, w)| (g - w).abs()).fold(0.0, f32::max);
+                        assert!(err < 1e-4 * a, "{} {f} Hz from {from}, {name}: off by {err}", ofdm.p.name);
+                    }
+                }
+            }
+        }
     }
 
     /// `detect` filters only as far as its search reads. On a recording with several
@@ -744,7 +853,7 @@ mod tests {
             let rx: Vec<f32> =
                 rx.iter().enumerate().map(|(i, v)| v + 0.3 * (w * i as f32).sin() + 0.01 * rng.bpsk()).collect();
             let eager = |from: usize| {
-                let mut band = Band::new(&rx[from..], ofdm.p.fs, lo, hi);
+                let mut band = Band::new(&rx, from, ofdm.p.fs, lo, hi);
                 band.fill_to(rx.len());
                 ofdm.detect_in(&mut band, &ofdm.pre_b_hp.1, from, 0)
             };

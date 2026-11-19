@@ -224,10 +224,12 @@ impl Receiver {
 
     fn trim(&mut self) {
         let l = self.modem.ofdm.p.symbol_len();
+        // Keep the history the next search warms its filters on.
         let keep_from = match self.pending {
             Some((b, _)) => b.saturating_sub(3 * l),
             None => self.search,
-        };
+        }
+        .saturating_sub(self.modem.ofdm.detect_history());
         if keep_from > 20 * l {
             self.buf.drain(..keep_from);
             self.base += keep_from as u64;
