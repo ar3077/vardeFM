@@ -6,10 +6,21 @@ run the same minor version.
 
 ## [Unreleased]
 
+## [0.3.2-ortoo.3] - 2026-11-20
+
+Merged upstream master (0061388).
+
 ### Changed
+- Direct-link retries now give way to a busy channel (8945173): on-air timing change,
+  still compatible with 0.3.x.
+- One `BUFFER` report per write, not two (e76405b).
+- Clearer refusal for a route with three digipeaters (ae029c9).
+- Header-only SNR bounded from below (3587c20).
 - **License.** VardeFM is now dual licensed under MIT OR Apache-2.0, at your option, so it
   can be embedded as a library in any application, including closed-source ones (#19). Releases up to and including
   0.3.2 remain available under GPL-3.0-or-later.
+- The fork's own additions (Unproto/KISS, session SN, LEVELS) are now also MIT OR
+  Apache-2.0; 0.3.2-ortoo.1 and .2 as released remain GPL-3.0-or-later.
 
 ## [0.3.2-ortoo.2] - 2026-11-19
 
