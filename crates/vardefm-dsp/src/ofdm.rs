@@ -24,30 +24,30 @@ const MIN_PREAMBLE_CORR: f32 = 0.3;
 /// Preamble B is looked for this many cyclic prefixes either side of where the
 /// Schmidl-Cox plateau puts it.
 ///
-/// The plateau is found on the detection band's filtered audio, and its middle moves
-/// with the filters' delay and with the audio's tilt: on a noiseless channel it puts
-/// preamble B from 0.8 prefixes early (wide, sender tilted 6 dB/octave up) to 1.6 late
-/// (wide, sender tilted 6 dB/octave down), and noise spreads that further. Within one
-/// prefix, the two wide links whose audio tilts down (de-emphasis on receive only, a
-/// sender tilted 6 dB/octave down) were not found without noise.
+/// The plateau is found on the detection band's filtered audio
+/// ([`OfdmParams::detect_band_hz`]), and its middle moves with the filters' delay and
+/// with the audio's tilt: on a noiseless channel it puts preamble B from 0.8 prefixes
+/// early (wide, sender tilted 6 dB/octave up) to 1.6 late (wide, sender tilted
+/// 6 dB/octave down), and noise spreads that further. Within one prefix, the two wide
+/// links whose audio tilts down (de-emphasis on receive only, a sender tilted
+/// 6 dB/octave down) were not found without noise.
 ///
-/// The figures here and at [`MIN_FAR_PREAMBLE_CORR`] are what `preamble_b_search_eval`
-/// in `vardefm-modem` prints.
+/// `preamble_b_search_eval` in `vardefm-modem` measures what this and
+/// [`MIN_FAR_PREAMBLE_CORR`] rest on.
 const FINE_TIMING_SPAN_NCP: usize = 3;
 /// What preamble B's correlation must reach more than one cyclic prefix from where the
 /// plateau puts it. Twice as many places are tried out there as within one prefix, and
 /// a plateau that is not a frame's (noise, the gap after a frame) more often has one
 /// that reaches [`MIN_PREAMBLE_CORR`]: such a pick then hides the frame that follows.
-/// Over three runs (SEED 1000, 50000, 90000) of 200 bursts per link at the sensitivity
-/// knee, 2 dB above it and at 20 dB CNR, and a minute of carrier without one at three
-/// levels, no such plateau had a place that reached 0.42. A plateau with preamble B
-/// within its search, but at neither best place, reached 0.40. Preamble B itself fell
-/// below 0.45 out there in at most 5.5% of the bursts on any link (wide at the knee,
-/// sender tilted 6 dB/octave down; 3% in the run the threshold was chosen on).
+///
+/// It sits between two things measured in the simulator: the most a place that is not
+/// preamble B reached at such a plateau (0.41), and what preamble B itself reaches out
+/// there near the sensitivity knee, where noise lowers it (below this in at most 5.5%
+/// of the bursts on the worst link).
 ///
 /// At a frame, the shoulder of preamble B's own peak passes this out there when the
-/// peak is just within one prefix (0.92 a sample from the peak), so a place out there
-/// must also beat the best within one prefix.
+/// peak is just within one prefix, so a place out there must also beat the best within
+/// one prefix.
 const MIN_FAR_PREAMBLE_CORR: f32 = 0.45;
 /// A symbol whose pilot noise exceeds this many times the typical level gets its own
 /// noise scale. Normal symbols almost never get there (the per-symbol estimate averages
@@ -121,6 +121,21 @@ pub struct PlateauPeaks {
 }
 
 impl PlateauPeaks {
+    /// How many cyclic prefixes either side of `expected` were searched.
+    pub const SPAN_NCP: usize = FINE_TIMING_SPAN_NCP;
+    /// What the far place's correlation must reach to be taken.
+    pub const MIN_FAR_CORR: f32 = MIN_FAR_PREAMBLE_CORR;
+
+    /// The higher of the two correlations.
+    pub fn best_corr(&self) -> f32 {
+        self.near.0.max(self.far.0)
+    }
+
+    /// The same, with every position moved `by` samples on.
+    fn shifted(self, by: usize) -> Self {
+        Self { expected: self.expected + by, near: (self.near.0, self.near.1 + by), far: (self.far.0, self.far.1 + by) }
+    }
+
     /// The start of preamble B's body, if either place correlates well enough: the one
     /// within a cyclic prefix if it reaches `MIN_PREAMBLE_CORR`, or the one further off
     /// if it is higher and reaches `MIN_FAR_PREAMBLE_CORR`.
@@ -310,7 +325,7 @@ impl Ofdm {
     /// Search `rx` from `from` for a frame. Returns the sample index where the
     /// body of preamble B starts.
     pub fn detect(&self, rx: &[f32], from: usize) -> Option<usize> {
-        self.detect_chunked(rx, from, 8 * self.p.symbol_len())
+        self.detect_traced(rx, from, |_| {})
     }
 
     /// Samples before `from` that [`detect`](Self::detect) reads to settle its filters.
@@ -321,30 +336,28 @@ impl Ofdm {
 
     /// [`detect`](Self::detect), filtering `chunk` samples past what the search needs
     /// each time it runs out (fewer, larger steps; the result does not depend on it).
-    fn detect_chunked(&self, rx: &[f32], from: usize, chunk: usize) -> Option<usize> {
+    fn detect_chunked(
+        &self,
+        rx: &[f32],
+        from: usize,
+        chunk: usize,
+        on_plateau: &mut dyn FnMut(PlateauPeaks),
+    ) -> Option<usize> {
         // Filtering keeps preamble A periodic (the filter is linear and time-invariant),
         // so the autocorrelation still works on the filtered copy. See
         // `OfdmParams::detect_band_hz` for the band.
         let (lo, hi) = self.p.detect_band_hz;
         let mut band = Band::new(rx, from, self.p.fs, lo, hi);
-        self.detect_in(&mut band, &self.pre_b_hp, from, chunk)
+        self.detect_in(&mut band, &self.pre_b_hp, from, chunk, on_plateau)
     }
 
     /// [`detect`](Self::detect), reporting what it found at every plateau it looked for
-    /// preamble B at, up to the one it confirmed. For measuring detection (see
-    /// `preamble_b_search_eval` in `vardefm-modem`), not for receiving.
+    /// preamble B at, up to the one it confirmed (positions are indices into `rx`).
+    /// For measuring detection (see `preamble_b_search_eval` in `vardefm-modem`), not
+    /// for receiving.
     #[doc(hidden)]
     pub fn detect_traced(&self, rx: &[f32], from: usize, mut on_plateau: impl FnMut(PlateauPeaks)) -> Option<usize> {
-        let (lo, hi) = self.p.detect_band_hz;
-        let mut band = Band::new(rx, from, self.p.fs, lo, hi);
-        let mut absolute = |p: PlateauPeaks| {
-            on_plateau(PlateauPeaks {
-                expected: from + p.expected,
-                near: (p.near.0, from + p.near.1),
-                far: (p.far.0, from + p.far.1),
-            })
-        };
-        self.detect_observed(&mut band, &self.pre_b_hp, from, 8 * self.p.symbol_len(), &mut absolute)
+        self.detect_chunked(rx, from, 8 * self.p.symbol_len(), &mut on_plateau)
     }
 
     /// Schmidl-Cox search over the band-passed copy of `rx[from..]` in `band`,
@@ -353,13 +366,10 @@ impl Ofdm {
     /// The filters run only as far as the search reads (plus `chunk`), so a search that
     /// stops early (at a burst) costs no more than the audio it has looked at. Each
     /// read is preceded by a fill to the sample it needs.
-    fn detect_in(&self, band: &mut Band, template: &[f32], from: usize, chunk: usize) -> Option<usize> {
-        self.detect_observed(band, template, from, chunk, &mut |_| {})
-    }
-
-    /// [`detect_in`](Self::detect_in), calling `on_plateau` with what it found at each
-    /// plateau it looked for preamble B at (positions relative to `from`).
-    fn detect_observed(
+    ///
+    /// `on_plateau` is called with what was found at each plateau preamble B was looked
+    /// for at.
+    fn detect_in(
         &self,
         band: &mut Band,
         template: &[f32],
@@ -408,10 +418,10 @@ impl Ofdm {
                         // in `new`), so the result does not depend on how much audio
                         // follows.
                         band.fill_to(expected + FINE_TIMING_SPAN_NCP * ncp + n);
-                        let peaks = self.preamble_b_peaks(band.hp(), template, expected);
+                        let peaks = self.preamble_b_peaks(band.hp(), template, expected).shifted(from);
                         on_plateau(peaks);
                         if let Some(b) = peaks.confirmed() {
-                            return Some(from + b);
+                            return Some(b);
                         }
                     }
                 }
@@ -423,14 +433,6 @@ impl Ofdm {
             d += 1;
         }
         None
-    }
-
-    /// Cross-correlate `x` with preamble B's `template` around `expected` and return
-    /// the best start, if the correlation there is high enough
-    /// ([`PlateauPeaks::confirmed`]).
-    #[cfg(test)]
-    fn fine_timing(&self, x: &[f32], template: &[f32], expected: usize) -> Option<usize> {
-        self.preamble_b_peaks(x, template, expected).confirmed()
     }
 
     /// Cross-correlate `x` with preamble B's `template` around `expected`: the best
@@ -452,12 +454,17 @@ impl Ofdm {
             if s < 0 || s as usize + n > x.len() {
                 continue;
             }
-            let w = &x[s as usize..s as usize + n];
-            let e = w.iter().map(|x| x * x).sum::<f32>().sqrt();
-            if e <= 0.0 {
+            // Energy and correlation in one pass: each sum adds the same terms in the
+            // same order as on its own, and the two do not wait for each other.
+            let (mut energy, mut dot) = (0.0f32, 0.0f32);
+            for (a, b) in x[s as usize..s as usize + n].iter().zip(template) {
+                energy += a * a;
+                dot += a * b;
+            }
+            if energy <= 0.0 {
                 continue;
             }
-            let c = w.iter().zip(template).map(|(a, b)| a * b).sum::<f32>().abs() / e;
+            let c = dot.abs() / energy.sqrt();
             let best = if off.abs() <= near_span { &mut near } else { &mut far };
             if c > best.0 {
                 *best = (c, s as usize);
@@ -957,11 +964,16 @@ mod tests {
             let eager = |from: usize| {
                 let mut band = Band::new(&rx, from, ofdm.p.fs, lo, hi);
                 band.fill_to(rx.len());
-                ofdm.detect_in(&mut band, &ofdm.pre_b_hp, from, 0)
+                ofdm.detect_in(&mut band, &ofdm.pre_b_hp, from, 0, &mut |_| {})
             };
             let lazy = |from: usize| {
                 let got = ofdm.detect(&rx, from);
-                assert_eq!(ofdm.detect_chunked(&rx, from, 0), got, "{} from {from}, no fill step", ofdm.p.name);
+                assert_eq!(
+                    ofdm.detect_chunked(&rx, from, 0, &mut |_| {}),
+                    got,
+                    "{} from {from}, no fill step",
+                    ofdm.p.name
+                );
                 got
             };
             let mut found = 0;
@@ -1123,17 +1135,19 @@ mod tests {
             let ofdm = Ofdm::new(p);
             let (name, ncp) = (ofdm.p.name, ofdm.p.ncp);
             let at = 5000;
-            let found =
-                |c: f32, expected: usize| ofdm.fine_timing(&audio_correlating(&ofdm, c, at), &ofdm.pre_b_hp, expected);
+            let found = |c: f32, expected: usize| {
+                ofdm.preamble_b_peaks(&audio_correlating(&ofdm, c, at), &ofdm.pre_b_hp, expected).confirmed()
+            };
             for expected in [at - ncp, at, at + ncp] {
                 assert_eq!(found(0.35, expected), Some(at), "{name}: 0.35 near, expected {expected}");
             }
             // Two prefixes off at least: just past one, the peak's shoulder is within it.
-            for expected in [at - 3 * ncp, at - 2 * ncp, at + 2 * ncp, at + 3 * ncp] {
+            let span = FINE_TIMING_SPAN_NCP * ncp;
+            for expected in [at - span, at - 2 * ncp, at + 2 * ncp, at + span] {
                 assert_eq!(found(0.42, expected), None, "{name}: 0.42 far, expected {expected}");
                 assert_eq!(found(0.5, expected), Some(at), "{name}: 0.5 far, expected {expected}");
             }
-            assert_eq!(found(0.9, at + 4 * ncp), None, "{name}: outside the search");
+            assert_eq!(found(0.9, at + span + ncp), None, "{name}: outside the search");
         }
     }
 
@@ -1170,7 +1184,7 @@ mod tests {
             let mut taken = 0;
             for outside in 1..=ncp {
                 for expected in [at - FINE_TIMING_SPAN_NCP * ncp - outside, at + FINE_TIMING_SPAN_NCP * ncp + outside] {
-                    if let Some(b) = ofdm.fine_timing(&x, &ofdm.pre_b_hp, expected) {
+                    if let Some(b) = ofdm.preamble_b_peaks(&x, &ofdm.pre_b_hp, expected).confirmed() {
                         taken += 1;
                         assert!(b.abs_diff(at) <= ncp / 4, "{name}: peak {outside} outside, taken at {b}");
                     }
