@@ -14,6 +14,9 @@ run the same minor version.
   the high-pass corner and the optional low-pass corner, Hz. The high-pass cannot be
   turned off: library users who set `detect_lowpass_hz: Some(f)` now set
   `detect_band_hz: (lo, Some(f))` with the mode's corner (420 Hz narrow, 340 Hz wide). (#12)
+- **`Ofdm::new` now panics on a cyclic prefix longer than 4/11 (0.36) of the FFT
+  length**: detection's wider search for the second preamble (#61) does not cover a
+  longer one. The built-in modes use 0.125.
 
 ### Fixed
 - A CTCSS tone in the received audio no longer hides bursts from detection. Detection
@@ -30,9 +33,6 @@ run the same minor version.
   looked for the second preamble too close to where its filtered audio put it. It now
   looks three times as far. In the simulator this also detects more weak bursts in
   both modes. (#61)
-- **`Ofdm::new` panics on a cyclic prefix longer than 4/11 (0.36) of the FFT length.**
-  Detection's search for the second preamble does not cover a longer one. Neither
-  built-in mode is affected (both use 0.125). (#61)
 - **Session id clash, partly.** A caller no longer picks a session id it has heard on
   the channel in the last 10 minutes. With a shared id, a caller could take the Data of
   a session it overheard as its own answer, report CONNECTED to a station that never
