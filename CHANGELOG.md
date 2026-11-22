@@ -10,6 +10,47 @@ run the same minor version.
 - **License.** VardeFM is now dual licensed under MIT OR Apache-2.0, at your option, so it
   can be embedded as a library in any application, including closed-source ones (#19). Releases up to and including
   0.3.2 remain available under GPL-3.0-or-later.
+- **`OfdmParams::detect_lowpass_hz` is now `detect_band_hz`**, a `(f32, Option<f32>)`:
+  the high-pass corner and the optional low-pass corner, Hz. The high-pass cannot be
+  turned off: library users who set `detect_lowpass_hz: Some(f)` now set
+  `detect_band_hz: (lo, Some(f))` with the mode's corner (420 Hz narrow, 340 Hz wide). (#12)
+
+### Fixed
+- A CTCSS tone in the received audio no longer hides bursts from detection. Detection
+  now high-passes the audio (8th order, 420 Hz narrow, 340 Hz wide) and confirms
+  preamble B on the high-passed audio. Before, a tone at the usual 750 Hz deviation hid
+  every burst for 12 of the 21 EIA tones on the wide data port, and almost every burst
+  in narrow mode on a radio whose de-emphasised audio output passes the sub-tone. In narrow mode the
+  higher corner also detects weak bursts better. The tone still corrupts demodulation at
+  the higher speed levels; that is not fixed here. (#12)
+- **Session id clash, partly.** A caller no longer picks a session id it has heard on
+  the channel in the last 10 minutes. With a shared id, a caller could take the Data of
+  a session it overheard as its own answer, report CONNECTED to a station that never
+  answered, and disturb that session (#27). A session the caller cannot hear can still
+  share its id.
+- **Connecting to a busy frequency.** A calling station took any Data burst with its
+  session id as the answer to its request. When another session on the frequency used
+  the same 1-byte id (1 call in 255), the caller reported CONNECTED, received that
+  session's data and stalled it (#27). The caller now connects only on a ConnectAck
+  naming its request. A called station that has not heard from the caller since its
+  ConnectAck resends the ConnectAck, not Data, when a burst goes unanswered, so a lost
+  ConnectAck no longer leaves the session half open. A called station also answers a
+  repeated ConnectReq only from its own caller. Works with 0.3.x stations, but a caller
+  of this version connecting to a 0.3.x station gives up more often on a lossy channel:
+  0.3.x does not resend its ConnectAck unless asked, and its Data no longer stands in
+  for it.
+- A session whose peer went silent stayed connected forever if the channel then stayed
+  busy (a stuck carrier, or other stations' traffic): retries, keepalives and a pending
+  disconnect all wait for a free channel, so the retry limit was never reached. The
+  same held for a connect request. The session (or connect attempt) now ends, and the
+  host gets `DISCONNECTED`, once the channel has held back a burst we want to send for
+  `LinkConfig::busy_timeout_s` (default 60 s) with none of our own bursts going out and
+  nothing heard from the peer. A short quiet gap in the carrier, or a repeat sent as a
+  digipeater, does not restart that time. A dropped session sends one Disc once the
+  channel is quiet (if that comes within the same time again), so a peer that was there
+  but could not be heard learns of it. A shorter setting is raised to a floor chosen to
+  cover an exchange with the peer through the session's digipeaters, so the peer's own
+  bursts and their repeats do not end a working session. (#32, #49)
 
 ## [0.3.2] - 2026-11-16
 
@@ -67,19 +108,6 @@ end stations and the digipeaters of a routed session should all run 0.3.2.
   at a faster level, the receiver acknowledged the longer copy but kept the shorter one,
   so the sender never sent the difference again. Only the receiving side changes: a
   station with this fix receives correctly from any version. (#29, thanks @mustig)
-- A session whose peer went silent stayed connected forever if the channel then stayed
-  busy (a stuck carrier, or other stations' traffic): retries, keepalives and a pending
-  disconnect all wait for a free channel, so the retry limit was never reached. The
-  same held for a connect request. The session (or connect attempt) now ends, and the
-  host gets `DISCONNECTED`, once the channel has held back a burst we want to send for
-  `LinkConfig::busy_timeout_s` (default 60 s) with none of our own bursts going out and
-  nothing heard from the peer. A short quiet gap in the carrier, or a repeat sent as a
-  digipeater, does not restart that time. A dropped session sends one Disc once the
-  channel is quiet (if that comes within the same time again), so a peer that was there
-  but could not be heard learns of it. A
-  shorter setting is raised to a floor chosen to cover an exchange with the peer
-  through the session's digipeaters, so the peer's own bursts and their repeats do not
-  end a working session. (#32, #49)
 - Two stations talking directly could drop their session when both started a burst at
   the same moment. Both then retried after the same wait, within 0.4 s of each other,
   and a retry did not give way to a busy channel, so every retry collided. A retry now
