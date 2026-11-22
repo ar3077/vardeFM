@@ -6,13 +6,6 @@ run the same minor version.
 
 ## [Unreleased]
 
-### Fixed
-- **Session id clash, partly.** A caller no longer picks a session id it has heard on
-  the channel in the last 10 minutes. With a shared id, a caller could take the Data of
-  a session it overheard as its own answer, report CONNECTED to a station that never
-  answered, and disturb that session (#27). A session the caller cannot hear can still
-  share its id. Separately, a connecting caller still accepts any Data with its id.
-
 ### Changed
 - **License.** VardeFM is now dual licensed under MIT OR Apache-2.0, at your option, so it
   can be embedded as a library in any application, including closed-source ones (#19). Releases up to and including
@@ -30,6 +23,11 @@ run the same minor version.
   in narrow mode on a radio whose de-emphasised audio output passes the sub-tone. In narrow mode the
   higher corner also detects weak bursts better. The tone still corrupts demodulation at
   the higher speed levels; that is not fixed here. (#12)
+- **Session id clash, partly.** A caller no longer picks a session id it has heard on
+  the channel in the last 10 minutes. With a shared id, a caller could take the Data of
+  a session it overheard as its own answer, report CONNECTED to a station that never
+  answered, and disturb that session (#27). A session the caller cannot hear can still
+  share its id. Separately, a connecting caller still accepts any Data with its id.
 
 ## [0.3.2] - 2026-11-16
 
