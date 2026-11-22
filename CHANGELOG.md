@@ -27,9 +27,7 @@ run the same minor version.
   the channel in the last 10 minutes. With a shared id, a caller could take the Data of
   a session it overheard as its own answer, report CONNECTED to a station that never
   answered, and disturb that session (#27). A session the caller cannot hear can still
-  share its id. Separately, a connecting caller still accepts any Data with its id.
-
-### Fixed
+  share its id.
 - **Connecting to a busy frequency.** A calling station took any Data burst with its
   session id as the answer to its request. When another session on the frequency used
   the same 1-byte id (1 call in 255), the caller reported CONNECTED, received that
