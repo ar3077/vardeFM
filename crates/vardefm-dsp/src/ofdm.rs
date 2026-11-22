@@ -21,6 +21,24 @@ const DETECT_THRESHOLD: f64 = 0.3;
 /// Pilots are averaged over this many symbols either side.
 const TRACK_HALF_WINDOW: usize = 4;
 const MIN_PREAMBLE_CORR: f32 = 0.3;
+/// Preamble B is looked for this many cyclic prefixes either side of where the
+/// Schmidl-Cox plateau puts it.
+///
+/// The plateau is found on the detection band's filtered audio, and its middle moves
+/// with the filters' delay and with the audio's tilt: on a noiseless channel it puts
+/// preamble B from 0.8 prefixes early (wide, sender tilted 6 dB/octave up) to 1.6 late
+/// (wide, sender tilted 6 dB/octave down), and noise spreads that further. Within one
+/// prefix, the two wide links whose audio tilts down (de-emphasis on receive only, a
+/// sender tilted 6 dB/octave down) were never found.
+const FINE_TIMING_SPAN_NCP: usize = 3;
+/// What preamble B's correlation must reach more than one cyclic prefix from where the
+/// plateau puts it. Three times as many places are tried out there, and a plateau that
+/// is not a frame's (noise, the gap after a frame) more often has one that reaches
+/// [`MIN_PREAMBLE_CORR`]: such a pick then hides the frame that follows. Over 200
+/// bursts per link at the sensitivity knee and 2 dB above it, and a minute of carrier
+/// without one, no wrong place reached 0.42, and preamble B fell below 0.45 in at most
+/// 3% of the bursts on any link.
+const MIN_FAR_PREAMBLE_CORR: f32 = 0.45;
 /// A symbol whose pilot noise exceeds this many times the typical level gets its own
 /// noise scale. Normal symbols almost never get there (the per-symbol estimate averages
 /// 18-24 real noise samples).
@@ -307,8 +325,9 @@ impl Ofdm {
                     if end - start >= ncp / 4 {
                         let a0 = from + ((start + end) / 2).saturating_sub(ncp / 2);
                         let expected = a0 - from + l + ncp;
-                        // `fine_timing` reads up to `expected + ncp + n`.
-                        band.fill_to(expected + ncp + n);
+                        // `fine_timing` reads up to `expected + FINE_TIMING_SPAN_NCP * ncp + n`,
+                        // which the loop condition keeps inside `len` (ncp is n / 8).
+                        band.fill_to(expected + FINE_TIMING_SPAN_NCP * ncp + n);
                         if let Some(b) = self.fine_timing(band.hp(), template, expected) {
                             return Some(from + b);
                         }
@@ -325,7 +344,9 @@ impl Ofdm {
     }
 
     /// Cross-correlate `x` with preamble B's `template` around `expected` and return
-    /// the best start.
+    /// the best start: within a cyclic prefix of `expected` if the correlation reaches
+    /// [`MIN_PREAMBLE_CORR`] there, or further off (see [`FINE_TIMING_SPAN_NCP`]) if it
+    /// is higher there and reaches [`MIN_FAR_PREAMBLE_CORR`].
     ///
     /// Detection passes the high-passed audio and the template filtered the same way,
     /// so the timing carries no filter delay. On unfiltered audio a sub-tone would leak
@@ -333,8 +354,10 @@ impl Ofdm {
     /// swell the energy it is normalised by, and the confirmation would fail.
     fn fine_timing(&self, x: &[f32], template: &[f32], expected: usize) -> Option<usize> {
         let n = self.p.nfft;
-        let span = self.p.ncp as isize;
-        let mut best = (0.0f32, 0usize);
+        let near_span = self.p.ncp as isize;
+        let span = FINE_TIMING_SPAN_NCP as isize * near_span;
+        let mut near = (0.0f32, 0usize);
+        let mut far = (0.0f32, 0usize);
         for off in -span..=span {
             let s = expected as isize + off;
             if s < 0 || s as usize + n > x.len() {
@@ -346,11 +369,16 @@ impl Ofdm {
                 continue;
             }
             let c = w.iter().zip(template).map(|(a, b)| a * b).sum::<f32>().abs() / e;
+            let best = if off.abs() <= near_span { &mut near } else { &mut far };
             if c > best.0 {
-                best = (c, s as usize);
+                *best = (c, s as usize);
             }
         }
-        (best.0 >= MIN_PREAMBLE_CORR).then_some(best.1)
+        if far.0 >= MIN_FAR_PREAMBLE_CORR && far.0 > near.0 {
+            Some(far.1)
+        } else {
+            (near.0 >= MIN_PREAMBLE_CORR).then_some(near.1)
+        }
     }
 
     /// Demodulate `nsym` data symbols of a frame whose preamble B starts at `b_start`.

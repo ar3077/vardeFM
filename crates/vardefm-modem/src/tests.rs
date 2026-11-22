@@ -448,3 +448,44 @@ fn a_non_finite_sample_does_not_hide_a_burst() {
         }
     }
 }
+
+/// A link whose audio response differs from the one the sender shaped its audio for
+/// (emphasis at one end only, or a sender tilted 6 dB/octave off) still has its burst
+/// found, and where the matched link's is. Detection's filters move the Schmidl-Cox
+/// plateau with the audio's tilt, and preamble B used to be looked for only one cyclic
+/// prefix either side of it: the two wide links that tilt down were never found, and
+/// narrow with the sender tilted down was one sample from that.
+#[test]
+fn mismatched_links_are_detected_where_the_matched_link_is() {
+    let us = FmChannelConfig::narrow().tx_emphasis_us;
+    for mode in ["narrow", "wide"] {
+        let base = FmChannelConfig::by_name(mode).unwrap();
+        let links: [(&str, FmChannelConfig, f32); 5] = [
+            ("matched", base.clone(), 0.0),
+            ("tx-pre-only", FmChannelConfig { tx_emphasis_us: us, rx_emphasis_us: None, ..base.clone() }, 0.0),
+            ("rx-de-only", FmChannelConfig { tx_emphasis_us: None, rx_emphasis_us: us, ..base.clone() }, 0.0),
+            ("tilt -6", base.clone(), -6.0),
+            ("tilt +6", base.clone(), 6.0),
+        ];
+        let rx_modem = modem(mode);
+        let tol = rx_modem.ofdm.p.ncp / 4;
+        let mut matched = None;
+        for (name, chan, tilt) in links {
+            let mut p = OfdmParams::by_name(mode).unwrap();
+            p.tilt_db_per_octave += tilt;
+            let audio = Modem::new(p, 0.15).modulate(&burst(1, 1, 0));
+            // Noiseless, then strong signals with noise, which moves the plateau too.
+            let cases = [(None, 0), (Some(20.0), 1), (Some(20.0), 2), (Some(20.0), 3)];
+            for (cnr_db, seed) in cases {
+                let rx = transmit(&FmChannelConfig { cnr_db, seed, ..chan.clone() }, &audio);
+                let got = rx_modem.ofdm.detect(&rx, 0);
+                // The first case is the matched link without noise.
+                let want = *matched.get_or_insert_with(|| got.expect("matched link not detected"));
+                assert!(
+                    got.is_some_and(|b| b.abs_diff(want) <= tol),
+                    "{mode} {name} cnr {cnr_db:?} seed {seed}: found {got:?}, matched link at {want}"
+                );
+            }
+        }
+    }
+}
