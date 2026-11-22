@@ -545,13 +545,17 @@ fn wide_links_that_tilt_down_are_detected_above_the_knee() {
 /// ```sh
 /// cargo test --release -p vardefm-modem preamble_b_search_eval -- --ignored --nocapture
 /// ```
-/// TRIALS bursts per link and CNR (200), NOISE_SECONDS of carrier without a burst (60).
+/// TRIALS bursts per link and CNR (200), NOISE_SECONDS of carrier without a burst (60),
+/// with noise seeds from SEED on (1000).
 #[test]
 #[ignore]
 fn preamble_b_search_eval() {
     use crate::detect_eval::env_or;
     let trials: u64 = env_or("TRIALS", 200);
     let noise_s: f32 = env_or("NOISE_SECONDS", 60.0);
+    let seed0: u64 = env_or("SEED", 1000);
+    assert!(noise_s > 0.0 && noise_s.is_finite(), "NOISE_SECONDS={noise_s}: must be a finite number more than 0");
+    assert!(trials > 0, "TRIALS must be at least 1");
     let max = |v: &[f32]| v.iter().copied().fold(0.0f32, f32::max);
     for mode in ["narrow", "wide"] {
         let rx_modem = modem(mode);
@@ -559,7 +563,7 @@ fn preamble_b_search_eval() {
         let ncp = ofdm.p.ncp;
         let tol = ncp / 4;
         let knee = if mode == "narrow" { 5.0 } else { 7.0 };
-        println!("{mode}: cyclic prefix {ncp} samples, {trials} bursts per line");
+        println!("{mode}: cyclic prefix {ncp} samples, {trials} bursts per line, seeds from {seed0}");
         println!("  plateau: where it puts preamble B, in prefixes late of where it is (lowest, median, highest)");
         println!("  found: bursts detected at preamble B, of them by a far place; wrong: detected elsewhere");
         println!("  far B: preamble B's correlation when it is far (lowest, 5th percentile), and bursts where it is below 0.45");
@@ -577,7 +581,7 @@ fn preamble_b_search_eval() {
                 let mut miss = Vec::new();
                 let (mut found, mut found_far, mut wrong, mut far_b_low) = (0, 0, 0, 0);
                 for seed in 0..n {
-                    let rx = transmit(&FmChannelConfig { cnr_db, seed: 1000 + seed, ..chan.clone() }, audio);
+                    let rx = transmit(&FmChannelConfig { cnr_db, seed: seed0 + seed, ..chan.clone() }, audio);
                     let mut plateaus = Vec::new();
                     let got = ofdm.detect_traced(&rx, 0, |p| plateaus.push(p));
                     match got {
@@ -630,7 +634,8 @@ fn preamble_b_search_eval() {
         }
         // A carrier without a burst: every plateau is a stray one.
         for cnr in [-10.0, 5.0, 25.0] {
-            let cfg = FmChannelConfig { cnr_db: Some(cnr), seed: 7, ..FmChannelConfig::by_name(mode).unwrap() };
+            let cfg =
+                FmChannelConfig { cnr_db: Some(cnr), seed: seed0 + trials, ..FmChannelConfig::by_name(mode).unwrap() };
             let rx = transmit(&cfg, &vec![0.0; (noise_s * cfg.fs) as usize]);
             let (mut stray, mut confirmed, mut from) = (Vec::new(), 0, 0);
             while let Some(b) = ofdm.detect_traced(&rx, from, |p| stray.push(p.near.0.max(p.far.0))) {

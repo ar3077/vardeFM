@@ -38,14 +38,15 @@ const FINE_TIMING_SPAN_NCP: usize = 3;
 /// plateau puts it. Twice as many places are tried out there as within one prefix, and
 /// a plateau that is not a frame's (noise, the gap after a frame) more often has one
 /// that reaches [`MIN_PREAMBLE_CORR`]: such a pick then hides the frame that follows.
-/// Over 200 bursts per link at the sensitivity knee, 2 dB above it and at 20 dB CNR,
-/// and a minute of carrier without one at three levels, no such plateau had a place
-/// that reached 0.42, and preamble B fell below 0.45 out there in at most 3% of the
-/// bursts on any link. A plateau with preamble B within its search, but at neither
-/// best place, reached 0.34.
+/// Over three runs (SEED 1000, 50000, 90000) of 200 bursts per link at the sensitivity
+/// knee, 2 dB above it and at 20 dB CNR, and a minute of carrier without one at three
+/// levels, no such plateau had a place that reached 0.42. A plateau with preamble B
+/// within its search, but at neither best place, reached 0.40. Preamble B itself fell
+/// below 0.45 out there in at most 5.5% of the bursts on any link (wide at the knee,
+/// sender tilted 6 dB/octave down; 3% in the run the threshold was chosen on).
 ///
 /// At a frame, the shoulder of preamble B's own peak passes this out there when the
-/// peak is just within one prefix (0.91 a sample from the peak), so a place out there
+/// peak is just within one prefix (0.92 a sample from the peak), so a place out there
 /// must also beat the best within one prefix.
 const MIN_FAR_PREAMBLE_CORR: f32 = 0.45;
 /// A symbol whose pilot noise exceeds this many times the typical level gets its own
