@@ -29,19 +29,23 @@ const MIN_PREAMBLE_CORR: f32 = 0.3;
 /// preamble B from 0.8 prefixes early (wide, sender tilted 6 dB/octave up) to 1.6 late
 /// (wide, sender tilted 6 dB/octave down), and noise spreads that further. Within one
 /// prefix, the two wide links whose audio tilts down (de-emphasis on receive only, a
-/// sender tilted 6 dB/octave down) were never found.
+/// sender tilted 6 dB/octave down) were not found without noise.
+///
+/// The figures here and at [`MIN_FAR_PREAMBLE_CORR`] are what `preamble_b_search_eval`
+/// in `vardefm-modem` prints.
 const FINE_TIMING_SPAN_NCP: usize = 3;
 /// What preamble B's correlation must reach more than one cyclic prefix from where the
 /// plateau puts it. Twice as many places are tried out there as within one prefix, and
 /// a plateau that is not a frame's (noise, the gap after a frame) more often has one
 /// that reaches [`MIN_PREAMBLE_CORR`]: such a pick then hides the frame that follows.
-/// Over 200 bursts per link at the sensitivity knee and 2 dB above it, and a minute of
-/// carrier without one, no such plateau had a place that reached 0.42, and preamble B
-/// fell below 0.45 in at most 3% of the bursts on any link.
+/// Over 200 bursts per link at the sensitivity knee, 2 dB above it and at 20 dB CNR,
+/// and a minute of carrier without one at three levels, no such plateau had a place
+/// that reached 0.42, and preamble B fell below 0.45 out there in at most 3% of the
+/// bursts on any link.
 ///
-/// At a frame, the shoulder of preamble B's own peak can pass this out there (0.49,
-/// with the peak at 0.91 within one prefix), so a place out there must also beat the
-/// best within one prefix.
+/// At a frame, the shoulder of preamble B's own peak passes this out there when the
+/// peak is just within one prefix (0.91 a sample from the peak), so a place out there
+/// must also beat the best within one prefix.
 const MIN_FAR_PREAMBLE_CORR: f32 = 0.45;
 /// A symbol whose pilot noise exceeds this many times the typical level gets its own
 /// noise scale. Normal symbols almost never get there (the per-symbol estimate averages
@@ -103,8 +107,43 @@ pub struct Frame {
     pub end: usize,
 }
 
+/// What detection found around one Schmidl-Cox plateau: where the plateau put the start
+/// of preamble B's body, and the best correlation with preamble B (and where) within
+/// one cyclic prefix of that and further off.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct PlateauPeaks {
+    pub expected: usize,
+    pub near: (f32, usize),
+    pub far: (f32, usize),
+}
+
+impl PlateauPeaks {
+    /// The start of preamble B's body, if either place correlates well enough: the one
+    /// within a cyclic prefix if it reaches `MIN_PREAMBLE_CORR`, or the one further off
+    /// if it is higher and reaches `MIN_FAR_PREAMBLE_CORR`.
+    pub fn confirmed(&self) -> Option<usize> {
+        if self.far.0 >= MIN_FAR_PREAMBLE_CORR && self.far.0 > self.near.0 {
+            Some(self.far.1)
+        } else {
+            (self.near.0 >= MIN_PREAMBLE_CORR).then_some(self.near.1)
+        }
+    }
+}
+
 impl Ofdm {
+    /// Panics if the cyclic prefix is longer than 0.4 of the FFT length.
     pub fn new(p: OfdmParams) -> Self {
+        // Detection waits for `nfft + 2 symbol_len()` samples past a plateau's end. The
+        // plateau puts preamble B at most `nfft + 1.5 ncp` past it, and the search for
+        // it reads `FINE_TIMING_SPAN_NCP * ncp + nfft` further. With a longer prefix
+        // the late end of that search would depend on how much audio has arrived.
+        assert!(
+            (2 * FINE_TIMING_SPAN_NCP - 1) * p.ncp <= 2 * p.nfft,
+            "ncp {} with nfft {}: the cyclic prefix is too long for the preamble B search",
+            p.ncp,
+            p.nfft
+        );
         let mut planner = FftPlanner::new();
         let fft = planner.plan_fft_forward(p.nfft);
         let ifft = planner.plan_fft_inverse(p.nfft);
@@ -286,6 +325,23 @@ impl Ofdm {
         self.detect_in(&mut band, &self.pre_b_hp, from, chunk)
     }
 
+    /// [`detect`](Self::detect), reporting what it found at every plateau it looked for
+    /// preamble B at, up to the one it confirmed. For measuring detection (see
+    /// `preamble_b_search_eval` in `vardefm-modem`), not for receiving.
+    #[doc(hidden)]
+    pub fn detect_traced(&self, rx: &[f32], from: usize, mut on_plateau: impl FnMut(PlateauPeaks)) -> Option<usize> {
+        let (lo, hi) = self.p.detect_band_hz;
+        let mut band = Band::new(rx, from, self.p.fs, lo, hi);
+        let mut absolute = |p: PlateauPeaks| {
+            on_plateau(PlateauPeaks {
+                expected: from + p.expected,
+                near: (p.near.0, from + p.near.1),
+                far: (p.far.0, from + p.far.1),
+            })
+        };
+        self.detect_observed(&mut band, &self.pre_b_hp, from, 8 * self.p.symbol_len(), &mut absolute)
+    }
+
     /// Schmidl-Cox search over the band-passed copy of `rx[from..]` in `band`,
     /// confirmed on its high-passed copy against preamble B's `template`.
     ///
@@ -293,6 +349,19 @@ impl Ofdm {
     /// stops early (at a burst) costs no more than the audio it has looked at. Each
     /// read is preceded by a fill to the sample it needs.
     fn detect_in(&self, band: &mut Band, template: &[f32], from: usize, chunk: usize) -> Option<usize> {
+        self.detect_observed(band, template, from, chunk, &mut |_| {})
+    }
+
+    /// [`detect_in`](Self::detect_in), calling `on_plateau` with what it found at each
+    /// plateau it looked for preamble B at (positions relative to `from`).
+    fn detect_observed(
+        &self,
+        band: &mut Band,
+        template: &[f32],
+        from: usize,
+        chunk: usize,
+        on_plateau: &mut dyn FnMut(PlateauPeaks),
+    ) -> Option<usize> {
         let n = self.p.nfft;
         let h = n / 2;
         let ncp = self.p.ncp;
@@ -301,14 +370,6 @@ impl Ofdm {
         if len < 3 * l {
             return None;
         }
-        // A plateau that ends at `d` puts preamble B at most at `d + n + 1.5 ncp`, the
-        // search for it reads `FINE_TIMING_SPAN_NCP * ncp + n` further, and the loop
-        // below runs while `d + n + 2 l < len`. With a longer cyclic prefix than this,
-        // the late end of that search would depend on how much audio has arrived.
-        debug_assert!(
-            (2 * FINE_TIMING_SPAN_NCP - 1) * ncp <= 2 * n,
-            "cyclic prefix too long for the preamble B search"
-        );
         band.fill_to(n);
         let mut p = 0f64;
         let mut r = 0f64;
@@ -337,11 +398,14 @@ impl Ofdm {
                     if end - start >= ncp / 4 {
                         let a0 = from + ((start + end) / 2).saturating_sub(ncp / 2);
                         let expected = a0 - from + l + ncp;
-                        // `fine_timing` reads up to `expected + FINE_TIMING_SPAN_NCP * ncp + n`.
+                        // The search reads up to `expected + FINE_TIMING_SPAN_NCP * ncp + n`.
                         // The loop condition keeps that inside `len` (see the assertion
-                        // above), so the result does not depend on how much audio follows.
+                        // in `new`), so the result does not depend on how much audio
+                        // follows.
                         band.fill_to(expected + FINE_TIMING_SPAN_NCP * ncp + n);
-                        if let Some(b) = self.fine_timing(band.hp(), template, expected) {
+                        let peaks = self.preamble_b_peaks(band.hp(), template, expected);
+                        on_plateau(peaks);
+                        if let Some(b) = peaks.confirmed() {
                             return Some(from + b);
                         }
                     }
@@ -357,15 +421,22 @@ impl Ofdm {
     }
 
     /// Cross-correlate `x` with preamble B's `template` around `expected` and return
-    /// the best start: within a cyclic prefix of `expected` if the correlation reaches
-    /// [`MIN_PREAMBLE_CORR`] there, or further off (see [`FINE_TIMING_SPAN_NCP`]) if it
-    /// is higher there and reaches [`MIN_FAR_PREAMBLE_CORR`].
+    /// the best start, if the correlation there is high enough
+    /// ([`PlateauPeaks::confirmed`]).
+    #[cfg(test)]
+    fn fine_timing(&self, x: &[f32], template: &[f32], expected: usize) -> Option<usize> {
+        self.preamble_b_peaks(x, template, expected).confirmed()
+    }
+
+    /// Cross-correlate `x` with preamble B's `template` around `expected`: the best
+    /// start within a cyclic prefix of `expected`, and the best further off (see
+    /// [`FINE_TIMING_SPAN_NCP`]).
     ///
     /// Detection passes the high-passed audio and the template filtered the same way,
     /// so the timing carries no filter delay. On unfiltered audio a sub-tone would leak
     /// into the correlation with preamble B's lowest carriers (281 Hz in wide) and
     /// swell the energy it is normalised by, and the confirmation would fail.
-    fn fine_timing(&self, x: &[f32], template: &[f32], expected: usize) -> Option<usize> {
+    fn preamble_b_peaks(&self, x: &[f32], template: &[f32], expected: usize) -> PlateauPeaks {
         let n = self.p.nfft;
         let near_span = self.p.ncp as isize;
         let span = FINE_TIMING_SPAN_NCP as isize * near_span;
@@ -387,11 +458,7 @@ impl Ofdm {
                 *best = (c, s as usize);
             }
         }
-        if far.0 >= MIN_FAR_PREAMBLE_CORR && far.0 > near.0 {
-            Some(far.1)
-        } else {
-            (near.0 >= MIN_PREAMBLE_CORR).then_some(near.1)
-        }
+        PlateauPeaks { expected, near, far }
     }
 
     /// Demodulate `nsym` data symbols of a frame whose preamble B starts at `b_start`.
@@ -1022,5 +1089,73 @@ mod tests {
             assert_eq!(out, bits, "{}", ofdm.p.name);
             println!("{}: SNR at rms 0.5 without noise {:.1} dB", ofdm.p.name, frame.snr_db);
         }
+    }
+
+    /// Audio that is silent except for `n` samples at `at`, which correlate `c` with
+    /// preamble B's template (the rest of their energy is noise at right angles to it).
+    fn audio_correlating(ofdm: &Ofdm, c: f32, at: usize) -> Vec<f32> {
+        let t = &ofdm.pre_b_hp;
+        let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
+        let tt = dot(t, t);
+        let mut rng = Prng::new(7);
+        let mut u: Vec<f32> = t.iter().map(|_| rng.bpsk()).collect();
+        let along = dot(&u, t) / tt;
+        u.iter_mut().zip(t).for_each(|(u, t)| *u -= along * t);
+        let scale = (1.0 - c * c).sqrt() * (tt / dot(&u, &u)).sqrt();
+        let mut x = vec![0.0; at];
+        x.extend(t.iter().zip(&u).map(|(t, u)| c * t + scale * u));
+        x.extend(vec![0.0; 4 * ofdm.p.symbol_len()]);
+        x
+    }
+
+    /// Preamble B is taken within a cyclic prefix of where the plateau puts it at a
+    /// correlation of [`MIN_PREAMBLE_CORR`], but further off only at a higher one: 0.42,
+    /// the most a plateau that was not a frame's reached out there when
+    /// [`MIN_FAR_PREAMBLE_CORR`] was chosen, is not enough.
+    #[test]
+    fn preamble_b_far_from_the_plateau_needs_a_higher_correlation() {
+        for p in [OfdmParams::narrow(), OfdmParams::wide()] {
+            let ofdm = Ofdm::new(p);
+            let (name, ncp) = (ofdm.p.name, ofdm.p.ncp);
+            let at = 5000;
+            let found =
+                |c: f32, expected: usize| ofdm.fine_timing(&audio_correlating(&ofdm, c, at), &ofdm.pre_b_hp, expected);
+            for expected in [at - ncp, at, at + ncp] {
+                assert_eq!(found(0.35, expected), Some(at), "{name}: 0.35 near, expected {expected}");
+            }
+            // Two prefixes off at least: just past one, the peak's shoulder is within it.
+            for expected in [at - 3 * ncp, at - 2 * ncp, at + 2 * ncp, at + 3 * ncp] {
+                assert_eq!(found(0.42, expected), None, "{name}: 0.42 far, expected {expected}");
+                assert_eq!(found(0.5, expected), Some(at), "{name}: 0.5 far, expected {expected}");
+            }
+            assert_eq!(found(0.9, at + 4 * ncp), None, "{name}: outside the search");
+        }
+    }
+
+    /// Preamble B's peak has shoulders: a sample or two off, the correlation is still
+    /// far above [`MIN_FAR_PREAMBLE_CORR`]. With the peak just within a cyclic prefix
+    /// of where the plateau puts it, the shoulder beyond the prefix is not taken for it.
+    #[test]
+    fn a_shoulder_far_from_the_plateau_does_not_beat_the_peak() {
+        for p in [OfdmParams::narrow(), OfdmParams::wide()] {
+            let ofdm = Ofdm::new(p);
+            let (name, ncp) = (ofdm.p.name, ofdm.p.ncp);
+            let at = 5000;
+            let x = audio_correlating(&ofdm, 1.0, at);
+            for expected in [at - ncp, at + ncp] {
+                let peaks = ofdm.preamble_b_peaks(&x, &ofdm.pre_b_hp, expected);
+                assert_eq!(peaks.near.1, at, "{name}");
+                // The case is the one meant only if the shoulder would pass on its own.
+                assert!(peaks.far.0 >= MIN_FAR_PREAMBLE_CORR, "{name}: shoulder {}", peaks.far.0);
+                assert_eq!(peaks.confirmed(), Some(at), "{name}, expected {expected}");
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "cyclic prefix is too long")]
+    fn a_cyclic_prefix_the_preamble_b_search_cannot_cover_is_refused() {
+        let p = OfdmParams::wide();
+        Ofdm::new(OfdmParams { ncp: p.nfft / 2, ..p });
     }
 }
