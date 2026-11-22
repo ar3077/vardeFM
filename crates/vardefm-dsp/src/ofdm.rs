@@ -41,7 +41,8 @@ const FINE_TIMING_SPAN_NCP: usize = 3;
 /// Over 200 bursts per link at the sensitivity knee, 2 dB above it and at 20 dB CNR,
 /// and a minute of carrier without one at three levels, no such plateau had a place
 /// that reached 0.42, and preamble B fell below 0.45 out there in at most 3% of the
-/// bursts on any link.
+/// bursts on any link. A plateau with preamble B within its search, but at neither
+/// best place, reached 0.34.
 ///
 /// At a frame, the shoulder of preamble B's own peak passes this out there when the
 /// peak is just within one prefix (0.91 a sample from the peak), so a place out there
@@ -132,14 +133,17 @@ impl PlateauPeaks {
 }
 
 impl Ofdm {
-    /// Panics if the cyclic prefix is longer than 0.4 of the FFT length.
+    /// Panics if the cyclic prefix is longer than 4/11 (0.36) of the FFT length.
     pub fn new(p: OfdmParams) -> Self {
         // Detection waits for `nfft + 2 symbol_len()` samples past a plateau's end. The
-        // plateau puts preamble B at most `nfft + 1.5 ncp` past it, and the search for
-        // it reads `FINE_TIMING_SPAN_NCP * ncp + nfft` further. With a longer prefix
-        // the late end of that search would depend on how much audio has arrived.
+        // plateau puts preamble B at most `nfft + 1.75 ncp` past it (the shortest
+        // plateau that counts, `ncp / 4`, at the very start of the search, where its
+        // middle is not moved back by half a prefix: otherwise 1.5), and the search
+        // for it reads `FINE_TIMING_SPAN_NCP * ncp + nfft` further. With a longer
+        // prefix the late end of that search would depend on how much audio has
+        // arrived.
         assert!(
-            (2 * FINE_TIMING_SPAN_NCP - 1) * p.ncp <= 2 * p.nfft,
+            (4 * FINE_TIMING_SPAN_NCP - 1) * p.ncp <= 4 * p.nfft,
             "ncp {} with nfft {}: the cyclic prefix is too long for the preamble B search",
             p.ncp,
             p.nfft
@@ -1152,10 +1156,35 @@ mod tests {
         }
     }
 
+    /// A peak just outside the search is not seen, but its shoulder just inside can
+    /// pass for it. What is then taken is within the quarter prefix that timing is
+    /// allowed to be off by.
+    #[test]
+    fn a_peak_just_outside_the_search_is_not_taken_far_from_where_it_is() {
+        for p in [OfdmParams::narrow(), OfdmParams::wide()] {
+            let ofdm = Ofdm::new(p);
+            let (name, ncp) = (ofdm.p.name, ofdm.p.ncp);
+            let at = 5000;
+            let x = audio_correlating(&ofdm, 1.0, at);
+            let mut taken = 0;
+            for outside in 1..=ncp {
+                for expected in [at - FINE_TIMING_SPAN_NCP * ncp - outside, at + FINE_TIMING_SPAN_NCP * ncp + outside] {
+                    if let Some(b) = ofdm.fine_timing(&x, &ofdm.pre_b_hp, expected) {
+                        taken += 1;
+                        assert!(b.abs_diff(at) <= ncp / 4, "{name}: peak {outside} outside, taken at {b}");
+                    }
+                }
+            }
+            // The case is the one meant only if a shoulder is taken at all.
+            assert!(taken > 0, "{name}");
+        }
+    }
+
     #[test]
     #[should_panic(expected = "cyclic prefix is too long")]
     fn a_cyclic_prefix_the_preamble_b_search_cannot_cover_is_refused() {
+        // 3/8 of the FFT length: just over the 4/11 the search covers.
         let p = OfdmParams::wide();
-        Ofdm::new(OfdmParams { ncp: p.nfft / 2, ..p });
+        Ofdm::new(OfdmParams { ncp: 3 * p.nfft / 8, ..p });
     }
 }

@@ -560,12 +560,11 @@ fn preamble_b_search_eval() {
         let tol = ncp / 4;
         let knee = if mode == "narrow" { 5.0 } else { 7.0 };
         println!("{mode}: cyclic prefix {ncp} samples, {trials} bursts per line");
-        println!(
-            "  plateau: where it puts preamble B, in prefixes late of where it is (noiseless; lowest, median, highest)"
-        );
+        println!("  plateau: where it puts preamble B, in prefixes late of where it is (lowest, median, highest)");
         println!("  found: bursts detected at preamble B, of them by a far place; wrong: detected elsewhere");
         println!("  far B: preamble B's correlation when it is far (lowest, 5th percentile), and bursts where it is below 0.45");
         println!("  shoulder: highest far correlation at a plateau whose near place is preamble B");
+        println!("  miss: highest correlation, near or far, at a plateau with preamble B inside its search but at neither place");
         println!("  stray: highest correlation, near or far, at a plateau with preamble B outside its search");
         // The highest correlation at a plateau that is not a frame's, over the mode.
         let mut stray_all = 0.0f32;
@@ -575,6 +574,7 @@ fn preamble_b_search_eval() {
             for cnr_db in [None, Some(knee), Some(knee + 2.0), Some(20.0)] {
                 let n = if cnr_db.is_none() { 1 } else { trials };
                 let (mut late, mut far_b, mut shoulder, mut stray) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+                let mut miss = Vec::new();
                 let (mut found, mut found_far, mut wrong, mut far_b_low) = (0, 0, 0, 0);
                 for seed in 0..n {
                     let rx = transmit(&FmChannelConfig { cnr_db, seed: 1000 + seed, ..chan.clone() }, audio);
@@ -599,6 +599,8 @@ fn preamble_b_search_eval() {
                             far_b.push(p.far.0);
                             low |= p.far.0 < 0.45;
                             found_far += usize::from(got.is_some_and(is_b) && p.confirmed() == got);
+                        } else {
+                            miss.push(p.near.0.max(p.far.0));
                         }
                     }
                     far_b_low += usize::from(low);
@@ -611,7 +613,7 @@ fn preamble_b_search_eval() {
                 };
                 stray_all = stray_all.max(max(&stray));
                 println!(
-                    "  {name:11} {:>7} | plateau {:+.2} {:+.2} {:+.2} | found {found:3} (far {found_far:3}) wrong {wrong} | far B {:.2} {:.2}, {far_b_low} below | shoulder {:.2} | stray {:.2} of {}",
+                    "  {name:11} {:>7} | plateau {:+.2} {:+.2} {:+.2} | found {found:3} (far {found_far:3}) wrong {wrong} | far B {:.2} {:.2}, {far_b_low} below | shoulder {:.2} | miss {:.2} of {} | stray {:.2} of {}",
                     cnr_db.map_or("clean".into(), |c| format!("{c} dB")),
                     at(&late, 0.0),
                     at(&late, 0.5),
@@ -619,6 +621,8 @@ fn preamble_b_search_eval() {
                     at(&far_b, 0.0),
                     at(&far_b, 0.05),
                     max(&shoulder),
+                    max(&miss),
+                    miss.len(),
                     max(&stray),
                     stray.len(),
                 );
