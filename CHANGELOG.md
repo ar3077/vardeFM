@@ -6,6 +6,18 @@ run the same minor version.
 
 ## [Unreleased]
 
+### Added
+- **Embeddable engine and C ABI.** `vardefm-engine` holds the station and
+  `RadioEngine` without sound-card, PTT-hardware or TCP dependencies.
+  `vardefm-ffi` exposes a thread-free C API (`vfm_new`, `vfm_rx_audio`,
+  `vfm_advance`, `vfm_tx_played`, host lines/data, optional TX/RX reports).
+  Release builds include an Apple XCFramework (device, simulator, macOS). CI runs
+  the C ABI tests under Miri. See [docs/EMBEDDING.md](docs/EMBEDDING.md).
+- **`RadioEngine::advance`.** Advances the sample clock without feeding audio, so
+  a host that gets no RX while keyed can still reach the PTT tail and watchdog.
+- **Structured burst reports.** `RadioEngine::reports` carries per-burst TX/RX
+  stats; log lines are formatted from the same values.
+
 ### Changed
 - **License.** VardeFM is now dual licensed under MIT OR Apache-2.0, at your option, so it
   can be embedded as a library in any application, including closed-source ones (#19). Releases up to and including
@@ -14,6 +26,9 @@ run the same minor version.
   the high-pass corner and the optional low-pass corner, Hz. The high-pass cannot be
   turned off: library users who set `detect_lowpass_hz: Some(f)` now set
   `detect_band_hz: (lo, Some(f))` with the mode's corner (420 Hz narrow, 340 Hz wide). (#12)
+- **`Ofdm::new` now panics on a cyclic prefix longer than 4/11 (0.36) of the FFT
+  length**: detection's wider search for the second preamble (#61) does not cover a
+  longer one. The built-in modes use 0.125.
 
 ### Fixed
 - A CTCSS tone in the received audio no longer hides bursts from detection. Detection
@@ -23,6 +38,13 @@ run the same minor version.
   in narrow mode on a radio whose de-emphasised audio output passes the sub-tone. In narrow mode the
   higher corner also detects weak bursts better. The tone still corrupts demodulation at
   the higher speed levels; that is not fixed here. (#12)
+- **Wide mode missed bursts on audio that tilts down.** Since the CTCSS fix above,
+  wide mode detected no burst on a clean signal, and missed most on a noisy one, when the
+  receiving radio de-emphasises and the sender does not pre-emphasise, or when the
+  sender's audio is tilted 6 dB/octave lower than the receiver expects. Detection
+  looked for the second preamble too close to where its filtered audio put it. It now
+  looks three times as far. In the simulator this also detects more weak bursts in
+  both modes. (#61)
 - **Session id clash, partly.** A caller no longer picks a session id it has heard on
   the channel in the last 10 minutes. With a shared id, a caller could take the Data of
   a session it overheard as its own answer, report CONNECTED to a station that never
