@@ -146,7 +146,8 @@ Useful options: `--txdelay` (leader length; it must exceed the radio's key-up ti
 - `crates/vardefm-tnc/src/radio/tests.rs`: the real-radio engine with fake sound cards
   and PTT. It checks that audio only plays while keyed, the PTT tail, and the watchdog.
 - `crates/vardefm-ffi/tests/session.rs`: the C ABI: a session between two modems, and
-  calls made from inside callbacks. CI also runs these under Miri
+  calls made from inside callbacks. CI also runs these under Miri when the C ABI or a crate it
+  depends on changes
   (see [docs/EMBEDDING.md](docs/EMBEDDING.md)).
 - `crates/vardefm-tnc/tests/simpair.rs`: end to end. Two host clients talk over the VARA
   TCP interface through `sim-pair` and transfer 10 kB each way at several signal levels.

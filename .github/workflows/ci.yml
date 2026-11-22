@@ -91,10 +91,49 @@ jobs:
             -lpthread -ldl -lm
           /tmp/vfm_smoke
 
+  # Whether this change can reach the code Miri tests: the workspace crates in
+  # vardefm-ffi's dependency tree (read from cargo tree, so a new dependency is
+  # picked up), Cargo.toml, Cargo.lock, the toolchain and cargo config, and this
+  # workflow. Runs Miri when unsure: no base to compare with (a force push to
+  # master, or another trigger), or a base missing from the clone.
+  changes:
+    name: Changed paths
+    runs-on: ubuntu-latest
+    outputs:
+      miri: ${{ steps.filter.outputs.miri }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - id: filter
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: |
+          run_miri() { echo "$1; running Miri."; echo "miri=true" >> "$GITHUB_OUTPUT"; exit 0; }
+          if [ -z "$BASE" ] || [ "$BASE" = 0000000000000000000000000000000000000000 ]; then
+            run_miri "No base commit"
+          fi
+          files="$(git diff --name-only "$BASE...$HEAD" 2>/dev/null)" || run_miri "Cannot diff $BASE...$HEAD"
+          # Workspace crates sit under crates/<name>; cargo tree prints them with their path.
+          crates="$(cargo tree -p vardefm-ffi -e normal,build,dev --prefix none --locked \
+            | sed -n 's|^\([a-z0-9_-]*\) v[^ ]* (.*/crates/\1)$|\1|p' | sort -u | paste -sd '|')"
+          [ -n "$crates" ] || run_miri "No workspace crates found in vardefm-ffi's tree"
+          echo "Crates Miri builds: $crates"
+          echo "Changed files:"
+          echo "$files"
+          if echo "$files" | grep -E "^(crates/($crates)/|Cargo\.(toml|lock)$|rust-toolchain(\.toml)?$|\.cargo/|\.github/workflows/ci\.yml$)" >/dev/null; then
+            echo "miri=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "miri=false" >> "$GITHUB_OUTPUT"
+          fi
+
   # Undefined behaviour at the C ABI (docs/EMBEDDING.md). The nightly is pinned so
   # that a new Miri cannot fail a build that changed nothing.
   miri:
     name: Miri (C ABI)
+    needs: changes
+    if: needs.changes.outputs.miri == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
