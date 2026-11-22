@@ -40,6 +40,12 @@ run the same minor version.
   0.3.x does not resend its ConnectAck unless asked, and its Data no longer stands in
   for it.
 
+### Fixed
+- **PTT on SIGTERM.** On Linux and macOS, `modem`, `tone`, `ptt-test` and `monitor` now
+  stop cleanly on SIGTERM (`systemctl stop`, `kill`, system shutdown) as they do on
+  Ctrl-C, and release PTT. Before, a stop during a transmission could leave the radio
+  keyed (#55).
+
 ## [0.3.2] - 2026-11-16
 
 On-air compatible with 0.3.0 and 0.3.1 for direct sessions. Digipeating is new and
