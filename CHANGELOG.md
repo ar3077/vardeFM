@@ -14,6 +14,13 @@ run the same minor version.
   the high-pass corner and the optional low-pass corner, Hz. The high-pass cannot be
   turned off: library users who set `detect_lowpass_hz: Some(f)` now set
   `detect_band_hz: (lo, Some(f))` with the mode's corner (420 Hz narrow, 340 Hz wide). (#12)
+- **`Ofdm::detect` now returns a `Detection`** in place of `Option<usize>`: `at`, where
+  preamble B starts if a frame was found (the old value), and `resume`, where the next
+  search starts, after a header that fails or once more audio has arrived. Library
+  users who called `ofdm.detect(rx, from)` now read `.at`. New: the `Detector` enum
+  (Schmidl-Cox only so far), `Ofdm::detect_with`, and `Ofdm::with_detector` /
+  `Modem::with_detector`. The receiver searches on from `resume` and no longer looks
+  back three symbols while a header is still arriving. (#37)
 
 ### Fixed
 - A CTCSS tone in the received audio no longer hides bursts from detection. Detection

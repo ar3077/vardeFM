@@ -75,7 +75,9 @@ pub struct Detection {
     /// once more audio has arrived. Schmidl-Cox resumes at its detection, which can
     /// lie past the end of the plateau it scanned. `from <= resume <= max(from,
     /// rx.len())`, with `resume == from` when `from` is at or past the end, and
-    /// `resume > from` when a frame was found.
+    /// `resume > from` when a frame was found. A caller that drops old audio keeps
+    /// [`Ofdm::detect_history`] samples before `resume`: the next search warms its
+    /// filters on them, and on cold filters a CTCSS tone rings at the search's start.
     pub resume: usize,
 }
 
@@ -328,9 +330,12 @@ impl Ofdm {
         let found = match detector {
             Detector::SchmidlCox => {
                 let at = self.detect_sc(rx, from);
-                // Preambles A and B, and margin for the fine timing around them.
-                let history = 3 * self.p.symbol_len() + 2 * self.p.nfft;
-                Detection { at, resume: at.unwrap_or(from.max(rx.len().saturating_sub(history))) }
+                // Nothing found: search again over the end that could hold a preamble
+                // still arriving, preambles A and B and margin for the fine timing
+                // around them. (Not the filter warm-up, `detect_history`, which the
+                // search reads before its start by itself.)
+                let rescan = 3 * self.p.symbol_len() + 2 * self.p.nfft;
+                Detection { at, resume: at.unwrap_or(from.max(rx.len().saturating_sub(rescan))) }
             }
         };
         // Checked in every build: a caller that searches on from `resume` after a
