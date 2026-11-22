@@ -72,8 +72,10 @@ So BPSK maps bit 0 to −1 and bit 1 to +1.
 
 ### 1.5 Receiver (informative)
 The reference receiver:
-1. Low-pass filters the audio (wide mode only) and runs a Schmidl-Cox autocorrelation.
-2. Confirms the frame by cross-correlating with preamble B.
+1. High-passes the audio (8th order, 420 Hz narrow, 340 Hz wide) to keep CTCSS tones out,
+   low-passes it too in wide mode (2500 Hz), and runs a Schmidl-Cox autocorrelation.
+2. Confirms the frame by cross-correlating the high-passed audio with preamble B, filtered
+   the same way.
 3. Places the FFT window mid cyclic prefix, which absorbs clock drift of ±ncp/2 samples
    over the frame.
 4. Estimates the channel from preamble B, smoothed across frequency, and decodes the
@@ -215,7 +217,10 @@ and checked by the `fer_gate` test. That file is the reference; roughly, the poi
 ### 3.1 Sessions
 - **Connect:** the caller sends `ConnectReq` (level 0, one codeword) with payload
   `"VFM1" | len | source call | len | destination call`, zero padded, and a random
-  non-zero session id. Through digipeaters the payload is
+  non-zero session id. The caller avoids ids it has heard in any burst in the last 10
+  minutes, or three keepalive intervals if that is longer (any id if it has heard all of
+  them), so it does not share an id with a session it can hear. This is local policy:
+  peers need nothing for it. A session it cannot hear may still share its id. Through digipeaters the payload is
   `"VFM2" | len | source | len | destination | count | (len | digipeater) × count`
   (section 3.4). A station that has `LISTEN ON` and the destination among its
   `MYCALL`s answers `ConnectAck` with the same payload and session id. The caller retries
