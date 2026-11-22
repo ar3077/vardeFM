@@ -32,12 +32,16 @@ const MIN_PREAMBLE_CORR: f32 = 0.3;
 /// sender tilted 6 dB/octave down) were never found.
 const FINE_TIMING_SPAN_NCP: usize = 3;
 /// What preamble B's correlation must reach more than one cyclic prefix from where the
-/// plateau puts it. Three times as many places are tried out there, and a plateau that
-/// is not a frame's (noise, the gap after a frame) more often has one that reaches
-/// [`MIN_PREAMBLE_CORR`]: such a pick then hides the frame that follows. Over 200
-/// bursts per link at the sensitivity knee and 2 dB above it, and a minute of carrier
-/// without one, no wrong place reached 0.42, and preamble B fell below 0.45 in at most
-/// 3% of the bursts on any link.
+/// plateau puts it. Twice as many places are tried out there as within one prefix, and
+/// a plateau that is not a frame's (noise, the gap after a frame) more often has one
+/// that reaches [`MIN_PREAMBLE_CORR`]: such a pick then hides the frame that follows.
+/// Over 200 bursts per link at the sensitivity knee and 2 dB above it, and a minute of
+/// carrier without one, no such plateau had a place that reached 0.42, and preamble B
+/// fell below 0.45 in at most 3% of the bursts on any link.
+///
+/// At a frame, the shoulder of preamble B's own peak can pass this out there (0.49,
+/// with the peak at 0.91 within one prefix), so a place out there must also beat the
+/// best within one prefix.
 const MIN_FAR_PREAMBLE_CORR: f32 = 0.45;
 /// A symbol whose pilot noise exceeds this many times the typical level gets its own
 /// noise scale. Normal symbols almost never get there (the per-symbol estimate averages
@@ -297,6 +301,14 @@ impl Ofdm {
         if len < 3 * l {
             return None;
         }
+        // A plateau that ends at `d` puts preamble B at most at `d + n + 1.5 ncp`, the
+        // search for it reads `FINE_TIMING_SPAN_NCP * ncp + n` further, and the loop
+        // below runs while `d + n + 2 l < len`. With a longer cyclic prefix than this,
+        // the late end of that search would depend on how much audio has arrived.
+        debug_assert!(
+            (2 * FINE_TIMING_SPAN_NCP - 1) * ncp <= 2 * n,
+            "cyclic prefix too long for the preamble B search"
+        );
         band.fill_to(n);
         let mut p = 0f64;
         let mut r = 0f64;
@@ -325,8 +337,9 @@ impl Ofdm {
                     if end - start >= ncp / 4 {
                         let a0 = from + ((start + end) / 2).saturating_sub(ncp / 2);
                         let expected = a0 - from + l + ncp;
-                        // `fine_timing` reads up to `expected + FINE_TIMING_SPAN_NCP * ncp + n`,
-                        // which the loop condition keeps inside `len` (ncp is n / 8).
+                        // `fine_timing` reads up to `expected + FINE_TIMING_SPAN_NCP * ncp + n`.
+                        // The loop condition keeps that inside `len` (see the assertion
+                        // above), so the result does not depend on how much audio follows.
                         band.fill_to(expected + FINE_TIMING_SPAN_NCP * ncp + n);
                         if let Some(b) = self.fine_timing(band.hp(), template, expected) {
                             return Some(from + b);

@@ -449,6 +449,27 @@ fn a_non_finite_sample_does_not_hide_a_burst() {
     }
 }
 
+/// The matched link of `mode` first, then links whose audio response differs from the
+/// one the sender shaped its audio for: emphasis at one end only, and a sender tilted
+/// 6 dB/octave off. Each with its channel and the audio of a level 1 burst sent on it.
+fn links(mode: &str) -> Vec<(&'static str, FmChannelConfig, Vec<f32>)> {
+    let us = FmChannelConfig::narrow().tx_emphasis_us;
+    let base = FmChannelConfig::by_name(mode).unwrap();
+    let links = [
+        ("matched", base.clone(), 0.0),
+        ("tx-pre-only", FmChannelConfig { tx_emphasis_us: us, rx_emphasis_us: None, ..base.clone() }, 0.0),
+        ("rx-de-only", FmChannelConfig { tx_emphasis_us: None, rx_emphasis_us: us, ..base.clone() }, 0.0),
+        ("tilt -6", base.clone(), -6.0),
+        ("tilt +6", base, 6.0),
+    ];
+    let sent = |tilt: f32| {
+        let mut p = OfdmParams::by_name(mode).unwrap();
+        p.tilt_db_per_octave += tilt;
+        Modem::new(p, 0.15).modulate(&burst(1, 1, 0))
+    };
+    links.into_iter().map(|(name, chan, tilt)| (name, chan, sent(tilt))).collect()
+}
+
 /// A link whose audio response differs from the one the sender shaped its audio for
 /// (emphasis at one end only, or a sender tilted 6 dB/octave off) still has its burst
 /// found, and where the matched link's is. Detection's filters move the Schmidl-Cox
@@ -457,23 +478,11 @@ fn a_non_finite_sample_does_not_hide_a_burst() {
 /// narrow with the sender tilted down was one sample from that.
 #[test]
 fn mismatched_links_are_detected_where_the_matched_link_is() {
-    let us = FmChannelConfig::narrow().tx_emphasis_us;
     for mode in ["narrow", "wide"] {
-        let base = FmChannelConfig::by_name(mode).unwrap();
-        let links: [(&str, FmChannelConfig, f32); 5] = [
-            ("matched", base.clone(), 0.0),
-            ("tx-pre-only", FmChannelConfig { tx_emphasis_us: us, rx_emphasis_us: None, ..base.clone() }, 0.0),
-            ("rx-de-only", FmChannelConfig { tx_emphasis_us: None, rx_emphasis_us: us, ..base.clone() }, 0.0),
-            ("tilt -6", base.clone(), -6.0),
-            ("tilt +6", base.clone(), 6.0),
-        ];
         let rx_modem = modem(mode);
         let tol = rx_modem.ofdm.p.ncp / 4;
         let mut matched = None;
-        for (name, chan, tilt) in links {
-            let mut p = OfdmParams::by_name(mode).unwrap();
-            p.tilt_db_per_octave += tilt;
-            let audio = Modem::new(p, 0.15).modulate(&burst(1, 1, 0));
+        for (name, chan, audio) in links(mode) {
             // Noiseless, then strong signals with noise, which moves the plateau too.
             let cases = [(None, 0), (Some(20.0), 1), (Some(20.0), 2), (Some(20.0), 3)];
             for (cnr_db, seed) in cases {
@@ -487,5 +496,32 @@ fn mismatched_links_are_detected_where_the_matched_link_is() {
                 );
             }
         }
+    }
+}
+
+/// The two wide links whose audio tilts down are found a little above the sensitivity
+/// knee too. Their plateau puts preamble B more than a cyclic prefix late, so it has to
+/// reach the higher correlation asked for out there, and noise lowers what it reaches:
+/// a threshold much above what keeps other plateaus out would lose these links again.
+#[test]
+fn wide_links_that_tilt_down_are_detected_near_the_knee() {
+    let rx_modem = modem("wide");
+    let tol = rx_modem.ofdm.p.ncp / 4;
+    let mut matched = None;
+    for (name, chan, audio) in links("wide") {
+        let clean = rx_modem.ofdm.detect(&transmit(&FmChannelConfig { cnr_db: None, ..chan.clone() }, &audio), 0);
+        let want = *matched.get_or_insert_with(|| clean.expect("matched link not detected"));
+        if !["rx-de-only", "tilt -6"].contains(&name) {
+            continue;
+        }
+        let seeds = 1..=10;
+        let found = seeds
+            .clone()
+            .filter(|&seed| {
+                let rx = transmit(&FmChannelConfig { cnr_db: Some(9.0), seed, ..chan.clone() }, &audio);
+                rx_modem.ofdm.detect(&rx, 0).is_some_and(|b| b.abs_diff(want) <= tol)
+            })
+            .count();
+        assert!(found >= 9, "{name}: found {found} of {} bursts at 9 dB CNR", seeds.count());
     }
 }

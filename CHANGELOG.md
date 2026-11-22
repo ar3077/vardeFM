@@ -23,6 +23,14 @@ run the same minor version.
   in narrow mode on a radio whose de-emphasised audio output passes the sub-tone. In narrow mode the
   higher corner also detects weak bursts better. The tone still corrupts demodulation at
   the higher speed levels; that is not fixed here. (#12)
+- **Wide mode could not receive on audio that tilts down.** Since the CTCSS fix above,
+  no burst was detected in wide mode, at any signal strength, when the receiving radio
+  de-emphasises and the sender does not pre-emphasise, or when the sender's audio is
+  tilted 6 dB/octave lower than the receiver expects. Detection looked for the second
+  preamble too close to where its filtered audio put it. It now looks three times as
+  far. Weak bursts are also detected more often on every link, in both modes: in the
+  simulator, 86 of 100 at 5 dB CNR in narrow mode (61 before) and 96 of 100 at 7 dB in
+  wide mode (85 before). (#61)
 - **Session id clash, partly.** A caller no longer picks a session id it has heard on
   the channel in the last 10 minutes. With a shared id, a caller could take the Data of
   a session it overheard as its own answer, report CONNECTED to a station that never
