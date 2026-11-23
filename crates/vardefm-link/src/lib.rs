@@ -811,7 +811,8 @@ impl Link {
                 if h.session != s.id || !s.route.accepts(&h) {
                     return;
                 }
-                self.events.push(LinkEvent::PeerSnr(rx.snr_db));
+                // The S/N of every burst of the session from the peer: not of another
+                // caller's request under our id, which is ignored below.
                 match h.kind {
                     Kind::ConnectReq if !s.route.caller => {
                         // Our ConnectAck was lost; send it again. Only to our caller: a
@@ -823,12 +824,16 @@ impl Link {
                         if !ours {
                             return;
                         }
+                        self.events.push(LinkEvent::PeerSnr(rx.snr_db));
                         s.last_heard = now;
                         self.held_since = None;
                         s.phase = Phase::Respond { at: now + turnaround, kind: Kind::ConnectAck, initiated: false };
                     }
-                    Kind::ConnectReq | Kind::ConnectAck => {}
-                    _ => self.on_session_burst(now, rx, req),
+                    Kind::ConnectReq | Kind::ConnectAck => self.events.push(LinkEvent::PeerSnr(rx.snr_db)),
+                    _ => {
+                        self.events.push(LinkEvent::PeerSnr(rx.snr_db));
+                        self.on_session_burst(now, rx, req)
+                    }
                 }
             }
         }
