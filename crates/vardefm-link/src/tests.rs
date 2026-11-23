@@ -1952,6 +1952,27 @@ fn called_station_answers_only_its_callers_repeated_request() {
 }
 
 #[test]
+fn peer_snr_only_for_our_callers_repeated_request() {
+    // A ConnectReq under our session id that names other stations or another path is
+    // another caller's (see above): its S/N is not our peer's, so no SN report.
+    let mut b = called_station();
+    let ours = ("LA1AAA", "LA2BBB-1");
+    b.on_burst(0.0, &connect_burst(Kind::ConnectReq, 9, ours, &[], false, 0));
+    assert!(b.take_events().contains(&LinkEvent::PeerSnr(30.0)));
+    for (calls, digis) in [(("LA5CCC", "LA9ZZZ"), &[][..]), (("LA5CCC", "LA2BBB-1"), &[]), (ours, &["LA3DDD"])] {
+        let mut other = connect_burst(Kind::ConnectReq, 9, calls, digis, false, 0);
+        other.snr_db = 7.5;
+        b.on_burst(1.0, &other);
+        let snr: Vec<_> = b.take_events().into_iter().filter(|e| matches!(e, LinkEvent::PeerSnr(_))).collect();
+        assert!(snr.is_empty(), "{calls:?} via {digis:?}: {snr:?}");
+    }
+    let mut again = connect_burst(Kind::ConnectReq, 9, ours, &[], false, 0);
+    again.snr_db = 12.5;
+    b.on_burst(2.0, &again);
+    assert!(b.take_events().contains(&LinkEvent::PeerSnr(12.5)), "our caller's repeat");
+}
+
+#[test]
 fn caller_gives_up_within_the_called_stations_connect_window() {
     // The called station resends its ConnectAck only while the caller could still be
     // retrying its ConnectReq. That window is computed on the called station's side, so
