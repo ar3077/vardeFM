@@ -1175,14 +1175,14 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "vardefm-audio"
-version = "0.3.2-ortoo.3"
+version = "0.3.2-ortoo.4"
 dependencies = [
  "cpal",
 ]
 
 [[package]]
 name = "vardefm-cli"
-version = "0.3.2-ortoo.3"
+version = "0.3.2-ortoo.4"
 dependencies = [
  "clap",
  "ctrlc",
@@ -1200,7 +1200,7 @@ dependencies = [
 
 [[package]]
 name = "vardefm-dsp"
-version = "0.3.2-ortoo.3"
+version = "0.3.2-ortoo.4"
 dependencies = [
  "num-complex",
  "rustfft",
@@ -1208,7 +1208,7 @@ dependencies = [
 
 [[package]]
 name = "vardefm-engine"
-version = "0.3.2-ortoo.3"
+version = "0.3.2-ortoo.4"
 dependencies = [
  "vardefm-dsp",
  "vardefm-fec",
@@ -1218,7 +1218,7 @@ dependencies = [
 
 [[package]]
 name = "vardefm-fec"
-version = "0.3.2-ortoo.3"
+version = "0.3.2-ortoo.4"
 dependencies = [
  "serde",
  "toml",
@@ -1227,7 +1227,7 @@ dependencies = [
 
 [[package]]
 name = "vardefm-ffi"
-version = "0.3.2-ortoo.3"
+version = "0.3.2-ortoo.4"
 dependencies = [
  "vardefm-engine",
  "vardefm-link",
@@ -1236,7 +1236,7 @@ dependencies = [
 
 [[package]]
 name = "vardefm-link"
-version = "0.3.2-ortoo.3"
+version = "0.3.2-ortoo.4"
 dependencies = [
  "vardefm-dsp",
  "vardefm-modem",
@@ -1244,7 +1244,7 @@ dependencies = [
 
 [[package]]
 name = "vardefm-modem"
-version = "0.3.2-ortoo.3"
+version = "0.3.2-ortoo.4"
 dependencies = [
  "serde",
  "toml",
@@ -1255,7 +1255,7 @@ dependencies = [
 
 [[package]]
 name = "vardefm-ptt"
-version = "0.3.2-ortoo.3"
+version = "0.3.2-ortoo.4"
 dependencies = [
  "gpiocdev",
  "hidapi",
@@ -1264,7 +1264,7 @@ dependencies = [
 
 [[package]]
 name = "vardefm-sim"
-version = "0.3.2-ortoo.3"
+version = "0.3.2-ortoo.4"
 dependencies = [
  "num-complex",
  "rand",
@@ -1274,7 +1274,7 @@ dependencies = [
 
 [[package]]
 name = "vardefm-tnc"
-version = "0.3.2-ortoo.3"
+version = "0.3.2-ortoo.4"
 dependencies = [
  "hound",
  "vardefm-audio",
