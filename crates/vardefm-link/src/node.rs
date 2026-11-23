@@ -60,8 +60,9 @@ impl Node {
 
     /// Called when the burst returned by `poll` has finished transmitting.
     pub fn tx_done(&mut self, now: f64) {
-        // A repeat is not the link's burst: its timers must not restart. But the
-        // channel was in use, so an Unproto burst waits for it to be clear again:
+        // A repeat is not the link's burst: its timers must not restart. That includes
+        // the held-back timer, as the link's own burst is still waiting for the channel.
+        // But the channel was in use, so an Unproto burst waits for it to be clear again:
         // the next station's answer comes 0.2 s after the repeat.
         if std::mem::take(&mut self.repeating) {
             self.link.channel_used(now);
@@ -220,5 +221,20 @@ mod tests {
         assert_eq!(node.repeats(), 1);
         // The link still takes it as a broadcast.
         assert!(node.link.take_events().contains(&LinkEvent::Unproto(frame)));
+    }
+
+    #[test]
+    fn repeat_does_not_restart_the_links_held_back_timer() {
+        let mut node = calling_digi(3);
+        assert!(node.poll(0.0, false).is_some_and(|(_, repeat)| !repeat));
+        node.tx_done(1.9);
+        assert!(node.poll(2.0, true).is_none());
+        assert_eq!(node.link.held_since, Some(2.0));
+        node.on_burst(2.0, &routed_request());
+        // The repeat is due 0.2 s after the burst, busy channel or not. It gets us on
+        // the air, but our own request is still held back.
+        assert!(node.poll(2.2, true).is_some_and(|(_, repeat)| repeat));
+        node.tx_done(2.9);
+        assert_eq!(node.link.held_since, Some(2.0));
     }
 }

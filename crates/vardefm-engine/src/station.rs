@@ -5,6 +5,7 @@
 
 use crate::host::{parse, Command};
 use crate::level::{LevelMeter, HOST_LEVEL_WINDOW_S};
+use crate::VERSION;
 use std::sync::Arc;
 use vardefm_link::{Link, LinkConfig, LinkEvent, Node, TxInfo};
 use vardefm_modem::{AudioLevel, Header, Modem, Receiver, RxBurst};
@@ -149,7 +150,7 @@ impl Station {
             }
             Command::Version => {
                 self.line("OK");
-                self.line(format!("VERSION {}", crate::VERSION));
+                self.line(format!("VERSION {VERSION}"));
             }
             Command::Ignored => self.line("OK"),
         }
