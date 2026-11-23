@@ -6,7 +6,13 @@ run the same minor version.
 
 ## [Unreleased]
 
-Merged upstream master (29bcf4f). From upstream:
+## [0.3.2-ortoo.4] - 2026-11-23
+
+Merged upstream master (29bcf4f). On the air this build is compatible with 0.3.2-ortoo.1
+to .3 and with 0.3.x, with one caveat from upstream #51: a caller of this build connecting
+to an older station gives up more often on a lossy channel, because the older station does
+not resend its ConnectAck unless asked. The entries below are upstream's, as in its
+changelog, except those marked "(fork)".
 
 ### Added
 - **Embeddable engine and C ABI.** `vardefm-engine` holds the station and
@@ -28,6 +34,13 @@ Merged upstream master (29bcf4f). From upstream:
 - **`Ofdm::new` now panics on a cyclic prefix longer than 4/11 (0.36) of the FFT
   length**: detection's wider search for the second preamble (#61) does not cover a
   longer one. The built-in modes use 0.125.
+
+- **The station now lives in `vardefm-engine` (fork).** Upstream moved it there (#46);
+  the fork's additions moved with it. Unconnected broadcasts go through the engine as
+  `HostIn::Kiss` and `HostOut::Kiss`; the KISS TCP port stays in `vardefm-tnc`. The C ABI
+  has no KISS port: it cannot send Unproto frames and drops received ones (their
+  `UNPROTO SN` lines still arrive), and a TX or RX report of an Unproto burst has `kind`
+  5, for which there is no `VFM_KIND_` constant.
 
 ### Fixed
 - A CTCSS tone in the received audio no longer hides bursts from detection. Detection
@@ -76,6 +89,10 @@ Merged upstream master (29bcf4f). From upstream:
   stop cleanly on SIGTERM (`systemctl stop`, `kill`, system shutdown) as they do on
   Ctrl-C, and release PTT. Before, a stop during a transmission could leave the radio
   keyed (#55).
+- **`SN` for another caller's request (fork).** Since upstream #51 a called station
+  ignores a repeated ConnectReq under its session id that names another caller or path,
+  but the host still got an `SN` line with that burst's S/N. `SN` now reports only the
+  session peer's bursts.
 
 ## [0.3.2-ortoo.3] - 2026-11-20
 
