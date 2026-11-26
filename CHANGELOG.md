@@ -39,7 +39,7 @@ to a busy frequency" below.
   `vardefm bench` counts its worst case. Receive-only: on-air compatible, and peers
   without it interoperate. `level_gate` and the recorded points stay single-pass, so a
   loss in the first pass cannot hide behind the rescue; `rescue_probe` (ignored, by
-  hand) measures the gain on full bursts. (#2)
+  hand) measures the gain on full bursts. (#22, thanks @mustig)
 - **License.** VardeFM is now dual licensed under MIT OR Apache-2.0, at your option, so it
   can be embedded as a library in any application, including closed-source ones.
   Releases up to and including 0.3.2 remain available under GPL-3.0-or-later. (#19, #48)
