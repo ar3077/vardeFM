@@ -120,7 +120,7 @@ to a busy frequency" below.
   the receiver keeps searching, so a known burst that starts inside it is still
   received, and the channel stays busy until the later of the two ends. Our own
   transmission ends the hold. Bursts a later version adds are then respected by this
-  one. (#26)
+  one. (#26, #69, thanks @ar3077)
 - **Colliding retries on a direct session.** Two stations talking directly could drop
   their session when both started a burst at the same moment. Both then retried after
   the same wait, within 0.4 s of each other, and a retry did not give way to a busy
