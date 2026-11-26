@@ -92,7 +92,7 @@ The reference receiver:
    failed ones' bits, and those are demapped again against only those points. It repeats
    while a pass rescues a codeword, in at most three passes over the burst. Near a level's
    single-pass threshold this decodes about a seventh to nine tenths of the codewords the
-   first pass lost (issue #2). Peers without it interoperate: nothing on the air changes.
+   first pass lost (#22). Peers without it interoperate: nothing on the air changes.
 
 Because the window never moves, a frame should stay shorter than
 `ncp / 2 / (clock error)`. At 100 ppm that is 13 s (narrow) or 6.7 s (wide).
