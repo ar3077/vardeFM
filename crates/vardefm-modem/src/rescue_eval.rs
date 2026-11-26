@@ -20,7 +20,7 @@
 //! Environment: `MODES` (narrow,wide), `LEVELS` (3,4,5,6), `TRIALS` (bursts per point,
 //! 200), `NCW` (codewords per burst, at most the level's longest burst; default that),
 //! `OFFSETS` (dB from the recorded point, -1,-0.5,-0.25,0,0.25,0.5), `PASSES` (most
-//! passes, `MAX_PASSES`).
+//! passes, 1 to `MAX_PASSES`, default that; to try more, raise `MAX_PASSES`).
 
 use super::*;
 use crate::detect_eval::{
@@ -123,7 +123,7 @@ fn rescue_probe() {
     let trials = env_or("TRIALS", 200u32);
     assert!(trials > 0, "TRIALS must be at least 1");
     let passes = env_or("PASSES", MAX_PASSES);
-    assert!(passes > 0, "PASSES must be at least 1");
+    assert!((1..=MAX_PASSES).contains(&passes), "PASSES must be 1 to {MAX_PASSES} (MAX_PASSES, the decoder's limit)");
     let offsets: Vec<f32> = env_list("OFFSETS", "-1,-0.5,-0.25,0,0.25,0.5");
     let ncw_env: Option<usize> = std::env::var("NCW").is_ok().then(|| env_or("NCW", 0));
     let base = load();
@@ -167,22 +167,27 @@ fn rescue_probe() {
     }
 }
 
-/// Bursts each case of `receiver_decoding_rescues_codewords` decodes.
+/// Bursts each case of `receiver_decoding_rescues_codewords` decodes per CNR.
 const TEST_BURSTS: u32 = 120;
+/// The share of codewords the first pass must lose for a CNR to count as near the
+/// level's threshold: enough failures to measure, enough decoded ones to help.
+const TEST_CER: std::ops::RangeInclusive<f32> = 0.04..=0.2;
+/// CNRs `check_rescue` tries before it gives up.
+const TEST_CNRS: usize = 16;
 
 /// Decodes `TEST_BURSTS` full bursts of `level` at `cnr` dB with one pass and as the
-/// receiver does (`Modem::decode_payload`), and checks that the receiver rescues at
-/// least `min_share` of the codewords the first pass lost, with the data that was sent.
-fn check_rescue(mode: &str, level: u8, cnr: f32, min_share: f32) {
-    let m = modem(mode);
+/// receiver does (`Modem::decode_payload`). Returns the codewords sent, those the
+/// first pass lost, and of those the ones the receiver decoded. Every codeword the
+/// receiver decodes must hold the data that was sent.
+fn rescue_counts(m: &Modem, mode: &str, level: u8, cnr: f32) -> (usize, usize, usize) {
     let ncw = m.max_ncw(level);
-    let truth = true_position(&m, mode, level, ncw);
+    let truth = true_position(m, mode, level, ncw);
     let nsym = m.header_symbols() + ncw * m.symbols_per_codeword(level);
-    let (fail1, rescued) = on_every_core(TEST_BURSTS, |t| {
+    on_every_core(TEST_BURSTS, |t| {
         let sent = burst(level, ncw, payload_seed(t));
-        let rx = through_channel(&m, mode, cnr, &sent, t);
+        let rx = through_channel(m, mode, cnr, &sent, t);
         let Some(frame) = m.ofdm.demodulate_known(&rx, truth, nsym, &m.header_carriers(&sent.header)) else {
-            return (0, 0);
+            return (ncw, ncw, 0);
         };
         let once = m.decode_payload_passes(&sent.header, &frame, 1).data;
         let rx_data = m.decode_payload(&sent.header, &frame);
@@ -192,26 +197,73 @@ fn check_rescue(mode: &str, level: u8, cnr: f32, min_share: f32) {
             }
         }
         let ok = |d: &[Option<Vec<u8>>]| d.iter().filter(|g| g.is_some()).count();
-        (ncw - ok(&once), ok(&rx_data) - ok(&once))
+        (ncw, ncw - ok(&once), ok(&rx_data) - ok(&once))
     })
     .into_iter()
-    .fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
-    println!("{mode} L{level} at {cnr} dB: {rescued} of {fail1} failed codewords rescued");
-    assert!(fail1 > 0, "{mode} L{level} at {cnr} dB: no codeword failed the first pass, nothing to rescue");
-    assert!(
-        rescued as f32 >= min_share * fail1 as f32,
-        "{mode} L{level} at {cnr} dB: {rescued} of {fail1} failed codewords rescued, want at least {:.0} %",
-        100.0 * min_share
+    .fold((0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2))
+}
+
+/// Checks that near the threshold of `level` the receiver rescues at least
+/// `min_share` of the codewords the first pass lost.
+///
+/// The threshold is found, not assumed: from `start_cnr` dB the CNR moves (0.25 dB
+/// steps, then halving between the two sides) until the first pass loses a share of
+/// the codewords within `TEST_CER`. A change to the demodulator, the decoder or the
+/// channel simulator that moves the threshold then only costs this test time.
+fn check_rescue(mode: &str, level: u8, start_cnr: f32, min_share: f32) {
+    let m = modem(mode);
+    // The nearest CNRs tried at which the first pass lost too many and too few.
+    let (mut low, mut high) = (None::<f32>, None::<f32>);
+    let mut cnr = start_cnr;
+    for _ in 0..TEST_CNRS {
+        let (sent, fail1, rescued) = rescue_counts(&m, mode, level, cnr);
+        let cer = fail1 as f32 / sent as f32;
+        println!("{mode} L{level} at {cnr} dB: {rescued} of {fail1} failed codewords rescued, of {sent} sent");
+        if TEST_CER.contains(&cer) {
+            assert!(
+                rescued as f32 >= min_share * fail1 as f32,
+                "{mode} L{level} at {cnr} dB: {rescued} of {fail1} failed codewords rescued, want at least {:.0} %",
+                100.0 * min_share
+            );
+            return;
+        }
+        if cer > *TEST_CER.end() {
+            low = Some(cnr);
+        } else {
+            high = Some(cnr);
+        }
+        cnr = match (low, high) {
+            (Some(l), Some(h)) => (l + h) / 2.0,
+            (Some(l), None) => l + 0.25,
+            (None, Some(h)) => h - 0.25,
+            (None, None) => unreachable!("one side was just set"),
+        };
+    }
+    panic!(
+        "{mode} L{level}: no CNR found from {start_cnr} dB in {TEST_CNRS} tries at which the first pass loses {:.0} to {:.0} % of the codewords",
+        100.0 * TEST_CER.start(),
+        100.0 * TEST_CER.end()
     );
 }
 
-/// Near the single-pass 10 % points of narrow levels 3 (16QAM) and 5 (64QAM), the
+/// Near the single-pass thresholds of narrow levels 3 (16QAM) and 5 (64QAM), the
 /// receiver rescues a good share of the codewords the first pass lost: 45 and 39 %
-/// of them on these bursts when written, and the bounds leave room below that. The CNRs are
-/// fixed rather than read from `perf/levels.toml`, so that recording the baseline
-/// again cannot move them.
+/// of them on these bursts when written, and the bounds leave room below that. The
+/// CNRs are where the search for the threshold starts (it ended there when written);
+/// they are not read from `perf/levels.toml`, so that recording the baseline again
+/// cannot move them.
 #[test]
 fn receiver_decoding_rescues_codewords() {
     check_rescue("narrow", 3, 6.25, 0.25);
     check_rescue("narrow", 5, 12.75, 0.2);
+}
+
+/// `check_rescue` finds the threshold from a start well off it, on either side.
+#[test]
+#[ignore]
+fn rescue_check_finds_the_threshold() {
+    check_rescue("narrow", 3, 7.5, 0.25);
+    check_rescue("narrow", 3, 5.0, 0.25);
+    check_rescue("narrow", 5, 14.0, 0.2);
+    check_rescue("narrow", 5, 11.5, 0.2);
 }

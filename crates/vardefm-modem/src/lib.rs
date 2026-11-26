@@ -299,25 +299,26 @@ impl Modem {
         self.decode_payload_passes(h, f, Self::decode_passes(h.level)).data
     }
 
-    /// Decode the payload codewords of `f` in at most `max_passes` passes: after the
-    /// first, each pass decodes the failed ones again with the bits of the decoded
-    /// ones known.
+    /// Decode the payload codewords of `f` in at most `max_passes` passes, and never
+    /// more than [`Modem::decode_passes`] of the level: after the first, each pass
+    /// decodes the failed ones again with the bits of the decoded ones known.
     ///
     /// The interleaver spreads all codewords of a burst over every symbol, so at
     /// 16QAM and 64QAM one axis of a point carries bits of several codewords. Once a
     /// codeword has passed its CRC its coded bits are known, and the failed
     /// codewords' bits that share an axis with them are demapped again against only
     /// the points that remain possible. That repeats while a pass rescues a codeword,
-    /// up to `max_passes`.
+    /// up to that limit.
     fn decode_payload_passes(&self, h: &Header, f: &Frame, max_passes: usize) -> Decoded {
+        // Only an axis of two or more bits can share them: one pass at BPSK and QPSK.
+        let max_passes = max_passes.min(Self::decode_passes(h.level));
+        let rescue = max_passes > 1;
         let level = LEVELS[h.level as usize];
         let code = &self.codes[h.level as usize];
         let m = level.modulation;
         let ncw = h.ncw as usize;
         let total = ncw * CW_BITS;
         let perm = permutation(SEED_INTERLEAVE, total);
-        // Only an axis of two or more bits can share them: not BPSK or QPSK.
-        let rescue = max_passes.min(Self::decode_passes(h.level)) > 1;
         /// A codeword's scrambled information bits (kept with `rescue`) and data.
         type Got = Option<(Option<Vec<u8>>, Vec<u8>)>;
         // Codeword `j` from its slot LLRs, if it decodes and passes the CRC: its data
@@ -336,7 +337,7 @@ impl Modem {
         let mut passes = 1;
         let mut known = vec![None; if rescue { total } else { 0 }];
         let mut new_ok: Vec<usize> = (0..ncw).filter(|&j| got[j].is_some()).collect();
-        while rescue && passes < max_passes && !new_ok.is_empty() {
+        while passes < max_passes && !new_ok.is_empty() {
             let failed: Vec<usize> = (0..ncw).filter(|&j| got[j].is_none()).collect();
             if failed.is_empty() {
                 break;
