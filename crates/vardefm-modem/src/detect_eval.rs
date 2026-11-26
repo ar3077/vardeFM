@@ -96,7 +96,7 @@ pub(crate) fn burst(level: u8, ncw: usize, seed: u32) -> Burst {
 
 /// The header of the burst whose preamble B starts at `b`, if it decodes.
 pub(crate) fn header_at(m: &Modem, rx: &[f32], b: usize) -> Option<Header> {
-    m.ofdm.demodulate(rx, b, m.header_symbols()).and_then(|f| m.decode_header(&f))
+    m.ofdm.demodulate(rx, b, m.header_symbols()).and_then(|f| m.decode_header(&f)?.known())
 }
 
 /// Whether the burst at `b`, whose header `h` has decoded, is the one sent: header
@@ -537,15 +537,17 @@ fn ctcss_pass(m: &Arc<Modem>, mode: &str, case: &CtcssCase, cnr: f32, level: u8,
 /// so this takes `at` as the resume point, which holds for Schmidl-Cox only: its
 /// `resume` is its detection, so `Receiver::step` searches on from there too after a
 /// header that fails, and the detector is scored here on the searches it makes in
-/// the receiver. After a header that decodes the receiver skips the frame it
-/// announces; this pass searches on from the detection instead, so that every
-/// detection in the audio is counted.
+/// the receiver. After a known header the receiver skips the frame it announces
+/// (after one of an unknown kind it searches on from the header's end); this pass
+/// searches on from the detection instead, so that every detection in the audio is
+/// counted. A decoded header counts whatever its kind: one of an unknown kind holds
+/// the channel busy.
 fn false_detections(m: &Modem, f: DetectFn, rx: &[f32]) -> (u32, u32) {
     let (mut dets, mut headers) = (0, 0);
     let mut next = advance(m, f, rx, 0);
     while let Some(b) = next {
         dets += 1;
-        if header_at(m, rx, b).is_some() {
+        if m.ofdm.demodulate(rx, b, m.header_symbols()).and_then(|f| m.decode_header(&f)).is_some() {
             headers += 1;
         }
         next = advance(m, f, rx, b);
